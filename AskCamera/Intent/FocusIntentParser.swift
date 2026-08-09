@@ -1,9 +1,21 @@
 import Foundation
 
+/// 方位修饰，用于同类多实例时的候选选择（"左边的杯子"）。
+enum SpatialHint: String {
+    case left, right, top, bottom
+}
+
 /// 对焦指令意图。
 struct FocusIntent: Equatable {
-    /// 对焦目标描述（如 "苹果"、"左边的水杯"）。nil 表示未指定目标（对焦显著物体/画面中心）。
+    /// 对焦目标描述（如 "苹果"）。nil 表示未指定目标（对焦显著物体）。
     let target: String?
+    /// 方位修饰。nil 表示未指定。
+    let spatialHint: SpatialHint?
+
+    init(target: String?, spatialHint: SpatialHint? = nil) {
+        self.target = target
+        self.spatialHint = spatialHint
+    }
 }
 
 /// 规则式意图解析（快路径）。
@@ -27,6 +39,15 @@ enum FocusIntentParser {
     /// 目标词里需要剔除的冗余修饰。
     private static let noiseWords = ["那个", "这个", "那只", "这只", "那本", "这本", "一下", "上的", "请", "帮我"]
 
+    /// 方位修饰前缀 → SpatialHint。
+    private static let spatialPrefixes: [(String, SpatialHint)] = [
+        ("左边的", .left), ("左侧的", .left), ("左面的", .left), ("左边", .left),
+        ("右边的", .right), ("右侧的", .right), ("右面的", .right), ("右边", .right),
+        ("上面的", .top), ("上方的", .top),
+        ("下面的", .bottom), ("下方的", .bottom),
+        ("left ", .left), ("right ", .right), ("top ", .top), ("bottom ", .bottom),
+    ]
+
     static func parse(_ rawText: String) -> FocusIntent? {
         let text = rawText
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -48,7 +69,17 @@ enum FocusIntentParser {
             }
             target = target.trimmingCharacters(in: .whitespaces)
 
-            return FocusIntent(target: target.isEmpty ? nil : target)
+            // 提取方位修饰前缀
+            var hint: SpatialHint?
+            for (prefix, spatialHint) in spatialPrefixes {
+                if target.lowercased().hasPrefix(prefix) {
+                    hint = spatialHint
+                    target = String(target.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+                    break
+                }
+            }
+
+            return FocusIntent(target: target.isEmpty ? nil : target, spatialHint: hint)
         }
 
         // 只有触发词没有目标（如 "对焦"）：对焦显著物体。

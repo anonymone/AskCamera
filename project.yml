@@ -14,6 +14,14 @@ targets:
     platform: iOS
     sources:
       - AskCamera
+      # Core ML 模型（gitignore 排除，构建前先跑 scripts/download_models.sh）
+      - path: Models/yoloworld_detector.mlpackage
+        optional: true
+      - path: Models/clip_text_encoder.mlpackage
+        optional: true
+      - path: Models/clip_vocab.json
+        optional: true
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.severuspeng.AskCamera
@@ -25,3 +33,4 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
+        COREML_CODEGEN_LANGUAGE: None

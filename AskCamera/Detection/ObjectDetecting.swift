@@ -9,9 +9,10 @@ struct DetectionResult {
 }
 
 /// 视觉检测抽象。
-/// 当前实现为 Vision 显著性检测（忽略 target 文本）；
-/// 下一阶段接入 YOLO-World（开放词汇，按 target 文本匹配任意物体）。
+/// - YOLOWorldDetector：开放词汇，按 target 英文文本匹配任意物体
+/// - SalientObjectDetector：显著性兜底，忽略 target
 protocol ObjectDetecting {
-    /// 在给定帧中查找目标。target 为 nil 时返回画面中最显著的物体。
-    func detect(target: String?, in pixelBuffer: CVPixelBuffer) async throws -> DetectionResult?
+    /// 在给定帧中查找目标，返回按置信度降序的候选列表。
+    /// target 为 nil 时的行为由实现决定（显著性检测返回所有显著物体）。
+    func detect(target: String?, in pixelBuffer: CVPixelBuffer) async throws -> [DetectionResult]
 }
