@@ -12,6 +12,7 @@ final class AskCameraViewModel: ObservableObject {
     private let speech = SpeechCommandListener()
     private let salientDetector = SalientObjectDetector()
     private var yoloDetector: YOLOWorldDetector?
+    private let tracker = FocusTracker()
     private let feedbackSynthesizer = AVSpeechSynthesizer()
 
     // MARK: - UI 状态
@@ -33,10 +34,23 @@ final class AskCameraViewModel: ObservableObject {
     private var listeningTask: Task<Void, Never>?
     private var highlightDismissTask: Task<Void, Never>?
 
+    /// 跟踪节流状态。
+    private var trackedLabel = ""
+    private var lastRefocusCenter: CGPoint = .zero
+    private var lastRefocusTime: TimeInterval = 0
+    private var lastHighlightTime: TimeInterval = 0
+
     // MARK: - 生命周期
 
     func onAppear() {
         Task { await camera.start() }
+        // 相机输出队列上逐帧驱动跟踪器
+        camera.frameHandler = { [weak self] pixelBuffer in
+            guard let self, let update = self.tracker.process(pixelBuffer) else { return }
+            Task { @MainActor in
+                self.handleTrackingUpdate(update)
+            }
+        }
         // 模型加载放后台，避免阻塞首帧（暖启动）
         Task.detached(priority: .userInitiated) { [weak self] in
             let detector = YOLOWorldDetector.loadFromBundle()
@@ -96,9 +110,22 @@ final class AskCameraViewModel: ObservableObject {
     // MARK: - 指令处理
 
     private func handleFinalTranscript(_ text: String) async {
-        guard let intent = FocusIntentParser.parse(text) else {
+        guard let command = FocusIntentParser.parseCommand(text) else {
             statusText = "\u{201C}\(text)\u{201D}（未识别为对焦指令）"
             return
+        }
+
+        let intent: FocusIntent
+        switch command {
+        case .reset:
+            tracker.stop()
+            focusHighlight = nil
+            camera.resetFocusToCenter()
+            statusText = "已恢复自动对焦"
+            speakFeedback("已恢复自动对焦")
+            return
+        case .focus(let focusIntent):
+            intent = focusIntent
         }
 
         let displayName = intent.target ?? "显著物体"
@@ -154,11 +181,23 @@ final class AskCameraViewModel: ObservableObject {
         }
     }
 
-    /// 将 Vision 归一化框（左下原点）转换为设备对焦点并执行对焦。
+    /// 将 Vision 归一化框（左下原点）转换为设备对焦点并执行对焦，随后启动焦点跟随。
     private func focusOnDetection(_ result: DetectionResult, displayName: String) {
-        guard let layer = camera.previewLayer else { return }
+        guard let layerRect = focusCamera(onVisionRect: result.boundingBox) else { return }
 
-        let box = result.boundingBox
+        trackedLabel = displayName
+        tracker.start(with: result.boundingBox)
+
+        showHighlight(rect: layerRect, label: displayName, autoDismiss: false)
+        statusText = "已对焦并跟踪：\(displayName)（置信度 \(String(format: "%.0f%%", result.confidence * 100))）"
+        speakFeedback("已对焦到\(displayName)")
+    }
+
+    /// Vision 框 → 预览层坐标 + 设备坐标，执行对焦。返回预览层中的框（供高亮显示）。
+    @discardableResult
+    private func focusCamera(onVisionRect box: CGRect) -> CGRect? {
+        guard let layer = camera.previewLayer else { return nil }
+
         // Vision（左下原点）→ 元数据输出坐标（左上原点）
         let metadataRect = CGRect(x: box.origin.x,
                                   y: 1 - box.origin.y - box.height,
@@ -169,15 +208,49 @@ final class AskCameraViewModel: ObservableObject {
         let devicePoint = layer.captureDevicePointConverted(fromLayerPoint: center)
 
         camera.focus(atDevicePoint: devicePoint)
-        showHighlight(rect: layerRect, label: displayName)
-        statusText = "已对焦：\(displayName)（置信度 \(String(format: "%.0f%%", result.confidence * 100))）"
-        speakFeedback("已对焦到\(displayName)")
+        lastRefocusCenter = CGPoint(x: box.midX, y: box.midY)
+        lastRefocusTime = CACurrentMediaTime()
+        return layerRect
+    }
+
+    // MARK: - 焦点跟随
+
+    private func handleTrackingUpdate(_ update: FocusTracker.Update) {
+        switch update {
+        case .lost:
+            focusHighlight = nil
+            statusText = "\u{201C}\(trackedLabel)\u{201D}已离开画面，恢复自动对焦"
+            camera.resetFocusToCenter()
+
+        case .tracking(let box):
+            let now = CACurrentMediaTime()
+            let center = CGPoint(x: box.midX, y: box.midY)
+            let moved = hypot(center.x - lastRefocusCenter.x, center.y - lastRefocusCenter.y)
+
+            // 节流：目标移动超过 3% 画幅且距上次对焦超过 0.3s 才重新对焦
+            if moved > 0.03, now - lastRefocusTime > 0.3 {
+                focusCamera(onVisionRect: box)
+            }
+
+            // 高亮框以约 10fps 刷新
+            if now - lastHighlightTime > 0.1, let layer = camera.previewLayer {
+                lastHighlightTime = now
+                let metadataRect = CGRect(x: box.origin.x,
+                                          y: 1 - box.origin.y - box.height,
+                                          width: box.width,
+                                          height: box.height)
+                let layerRect = layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+                showHighlight(rect: layerRect, label: trackedLabel, autoDismiss: false)
+            }
+        }
     }
 
     // MARK: - 点击对焦
 
     func handleTap(at viewPoint: CGPoint) {
         guard let layer = camera.previewLayer else { return }
+        // 手动点击打断跟踪
+        tracker.stop()
         let devicePoint = layer.captureDevicePointConverted(fromLayerPoint: viewPoint)
         camera.focus(atDevicePoint: devicePoint)
 
@@ -192,9 +265,10 @@ final class AskCameraViewModel: ObservableObject {
 
     // MARK: - 反馈
 
-    private func showHighlight(rect: CGRect, label: String) {
+    private func showHighlight(rect: CGRect, label: String, autoDismiss: Bool = true) {
         focusHighlight = FocusHighlight(rect: rect, label: label)
         highlightDismissTask?.cancel()
+        guard autoDismiss else { return }
         highlightDismissTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }

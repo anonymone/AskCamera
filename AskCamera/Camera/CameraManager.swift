@@ -22,6 +22,9 @@ final class CameraManager: NSObject, ObservableObject {
     private let frameLock = NSLock()
     private var _latestFrame: CVPixelBuffer?
 
+    /// 每帧回调（在相机输出队列执行，勿做耗时 UI 操作）。用于焦点跟踪。
+    var frameHandler: ((CVPixelBuffer) -> Void)?
+
     // MARK: - 生命周期
 
     func start() async {
@@ -131,5 +134,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         frameLock.lock()
         _latestFrame = pixelBuffer
         frameLock.unlock()
+        frameHandler?(pixelBuffer)
     }
 }

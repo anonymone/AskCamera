@@ -18,9 +18,34 @@ struct FocusIntent: Equatable {
     }
 }
 
+/// 语音指令。
+enum FocusCommand: Equatable {
+    case focus(FocusIntent)
+    /// 取消对焦/停止跟踪，恢复画面中心连续自动对焦。
+    case reset
+}
+
 /// 规则式意图解析（快路径）。
 /// 覆盖常见句式；复杂指代表达式后续接入 Foundation Models 慢路径。
 enum FocusIntentParser {
+
+    /// 取消指令关键词。
+    private static let resetKeywords = [
+        "取消对焦", "取消跟踪", "停止对焦", "停止跟踪", "取消聚焦",
+        "复位", "回到中心", "reset focus", "stop tracking", "cancel focus",
+    ]
+
+    /// 解析语音指令（对焦 / 取消）。非指令返回 nil。
+    static func parseCommand(_ rawText: String) -> FocusCommand? {
+        let lowered = rawText.lowercased()
+        if resetKeywords.contains(where: { lowered.contains($0) }) {
+            return .reset
+        }
+        if let intent = parse(rawText) {
+            return .focus(intent)
+        }
+        return nil
+    }
 
     /// 中英文对焦句式。捕获组 1 为目标词。
     private static let patterns: [NSRegularExpression] = {

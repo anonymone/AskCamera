@@ -49,7 +49,7 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 
 - [x] 阶段一：相机预览 + 点击对焦 + 语音链路（ASR → 意图 → 显著物体对焦）
 - [x] 阶段二：YOLO-World V2 开放词汇检测（Core ML，任意目标词匹配 + 方位修饰选择）
-- [ ] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标
+- [x] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标（节流对焦、跟丢自动复位）
 - [ ] 阶段四：Foundation Models 复杂指令解析（"封面蓝色的那本书"）
 - [ ] 阶段五：FastVLM 指代消歧、LiDAR 深度辅助
 
@@ -73,4 +73,5 @@ open AskCamera.xcodeproj
   - "对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
   - 同类多个物体时支持方位修饰："左边的" / "右边的" / "上面的" / "下面的"
   - 只说"对焦"（无目标词）会对焦到画面中最显著的物体
+- 对焦成功后焦点自动跟随目标移动；说"取消对焦"/"停止跟踪"或点击画面可打断
 - 扬声器开关：开启后对焦成功有语音播报（`AVSpeechSynthesizer`，端侧）

@@ -44,8 +44,7 @@ struct ContentView: View {
                         .position(x: highlight.rect.midX, y: highlight.rect.minY - 16)
                 }
                 .transition(.scale(scale: 1.3).combined(with: .opacity))
-                .id(highlight.id)
-                .animation(.spring(duration: 0.3), value: viewModel.focusHighlight)
+                .animation(.spring(duration: 0.25), value: viewModel.focusHighlight)
         }
     }
 
