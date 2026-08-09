@@ -228,14 +228,8 @@ final class AskCameraViewModel: ObservableObject {
 
     /// 调试模式：把本次所有候选框画到预览上（5 秒后自动清除）。
     private func updateDebugBoxes(with candidates: [DetectionResult]) {
-        guard let layer = camera.previewLayer else { return }
-        debugBoxes = candidates.map { result in
-            let box = result.boundingBox
-            let metadataRect = CGRect(x: box.origin.x,
-                                      y: 1 - box.origin.y - box.height,
-                                      width: box.width,
-                                      height: box.height)
-            let layerRect = layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+        debugBoxes = candidates.compactMap { result in
+            guard let layerRect = camera.layerRect(fromVisionRect: result.boundingBox) else { return nil }
             return DebugBox(rect: layerRect,
                             caption: "\(result.label) \(Int(result.confidence * 100))%")
         }
@@ -298,14 +292,9 @@ final class AskCameraViewModel: ObservableObject {
     /// Vision 框 → 预览层坐标 + 设备坐标，执行对焦。返回预览层中的框（供高亮显示）。
     @discardableResult
     private func focusCamera(onVisionRect box: CGRect) -> CGRect? {
-        guard let layer = camera.previewLayer else { return nil }
+        guard let layer = camera.previewLayer,
+              let layerRect = camera.layerRect(fromVisionRect: box) else { return nil }
 
-        // Vision（左下原点）→ 元数据输出坐标（左上原点）
-        let metadataRect = CGRect(x: box.origin.x,
-                                  y: 1 - box.origin.y - box.height,
-                                  width: box.width,
-                                  height: box.height)
-        let layerRect = layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
         let center = CGPoint(x: layerRect.midX, y: layerRect.midY)
         let devicePoint = layer.captureDevicePointConverted(fromLayerPoint: center)
 
@@ -335,13 +324,9 @@ final class AskCameraViewModel: ObservableObject {
             }
 
             // 高亮框以约 10fps 刷新
-            if now - lastHighlightTime > 0.1, let layer = camera.previewLayer {
+            if now - lastHighlightTime > 0.1,
+               let layerRect = camera.layerRect(fromVisionRect: box) {
                 lastHighlightTime = now
-                let metadataRect = CGRect(x: box.origin.x,
-                                          y: 1 - box.origin.y - box.height,
-                                          width: box.width,
-                                          height: box.height)
-                let layerRect = layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
                 showHighlight(rect: layerRect, label: trackedLabel, autoDismiss: false)
             }
         }

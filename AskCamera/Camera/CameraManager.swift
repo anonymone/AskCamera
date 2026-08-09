@@ -21,6 +21,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     private let frameLock = NSLock()
     private var _latestFrame: CVPixelBuffer?
+    private var _bufferSize: CGSize = .zero
 
     /// 每帧回调（在相机输出队列执行，勿做耗时 UI 操作）。用于焦点跟踪。
     var frameHandler: ((CVPixelBuffer) -> Void)?
@@ -92,6 +93,31 @@ final class CameraManager: NSObject, ObservableObject {
         return _latestFrame
     }
 
+    // MARK: - 坐标转换
+
+    /// Vision 归一化框（左下原点，相对旋转后的输出帧）→ 预览层坐标。
+    ///
+    /// 关键：输出连接旋转为竖屏后，帧坐标 ≠ 元数据坐标（后者定义在未旋转的
+    /// 传感器方向上）。必须先经 metadataOutputRectConverted(fromOutputRect:)
+    /// 转回元数据空间，再交给预览层转换，否则整条链路差 90°。
+    func layerRect(fromVisionRect box: CGRect) -> CGRect? {
+        guard let layer = previewLayer else { return nil }
+        frameLock.lock()
+        let bufferSize = _bufferSize
+        frameLock.unlock()
+        guard bufferSize != .zero else { return nil }
+
+        // Vision（左下原点）→ 输出帧像素坐标（左上原点）
+        let outputRect = CGRect(x: box.origin.x * bufferSize.width,
+                                y: (1 - box.origin.y - box.height) * bufferSize.height,
+                                width: box.width * bufferSize.width,
+                                height: box.height * bufferSize.height)
+        // 输出帧像素坐标 → 元数据坐标（传感器空间，归一化）
+        let metadataRect = videoOutput.metadataOutputRectConverted(fromOutputRect: outputRect)
+        // 元数据坐标 → 预览层坐标
+        return layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+    }
+
     // MARK: - 对焦控制
 
     /// 对焦到设备坐标点（{0,0} 左上 ~ {1,1} 右下，相对横屏 home 键在右方向）。
@@ -133,6 +159,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         frameLock.lock()
         _latestFrame = pixelBuffer
+        _bufferSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                             height: CVPixelBufferGetHeight(pixelBuffer))
         frameLock.unlock()
         frameHandler?(pixelBuffer)
     }
