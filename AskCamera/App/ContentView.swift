@@ -17,6 +17,8 @@ struct ContentView: View {
                 }
 
                 focusHighlightOverlay
+                countdownOverlay
+                recordingBadge
             }
             .ignoresSafeArea()
 
@@ -56,6 +58,48 @@ struct ContentView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+    // MARK: - 倒计时 / 录像指示
+
+    @ViewBuilder
+    private var countdownOverlay: some View {
+        if let remaining = viewModel.captureScheduler.countdownRemaining {
+            Text("\(remaining)")
+                .font(.system(size: 96, weight: .thin, design: .rounded))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+                .transition(.scale.combined(with: .opacity))
+                .animation(.easeInOut(duration: 0.2), value: remaining)
+                .allowsHitTesting(false)
+        }
+    }
+
+    @ViewBuilder
+    private var recordingBadge: some View {
+        if viewModel.camera.isRecording {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 10, height: 10)
+                Text(timeString(viewModel.captureScheduler.recordingElapsedSeconds))
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(.white)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.black.opacity(0.55), in: Capsule())
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .padding(.top, 56)
+            .padding(.trailing, 16)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func timeString(_ total: Int) -> String {
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%02d:%02d", m, s)
     }
 
     // MARK: - 调试候选框
@@ -98,7 +142,18 @@ struct ContentView: View {
         VStack(spacing: 12) {
             captionPanel
 
-            HStack(spacing: 28) {
+            if viewModel.captureScheduler.isCountingDown {
+                Button("取消倒计时") {
+                    viewModel.cancelCountdownTapped()
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.black.opacity(0.55), in: Capsule())
+            }
+
+            HStack(spacing: 22) {
                 Toggle(isOn: $viewModel.voiceFeedbackEnabled) {
                     Image(systemName: "speaker.wave.2")
                 }
@@ -106,6 +161,8 @@ struct ContentView: View {
                 .tint(.yellow)
                 .foregroundStyle(.white)
 
+                recordButton
+                shutterButton
                 micButton
 
                 Toggle(isOn: $viewModel.debugMode) {
@@ -149,23 +206,68 @@ struct ContentView: View {
         }
     }
 
+    private var shutterButton: some View {
+        Button {
+            viewModel.shutterTapped()
+        } label: {
+            ZStack {
+                Circle()
+                    .strokeBorder(.white, lineWidth: 3)
+                    .frame(width: 72, height: 72)
+                Circle()
+                    .fill(.white)
+                    .frame(width: 58, height: 58)
+            }
+        }
+        .disabled(viewModel.camera.isRecording || viewModel.captureScheduler.isCountingDown)
+        .opacity(viewModel.camera.isRecording || viewModel.captureScheduler.isCountingDown ? 0.4 : 1)
+        .accessibilityLabel("拍照")
+    }
+
+    private var recordButton: some View {
+        Button {
+            viewModel.recordTapped()
+        } label: {
+            ZStack {
+                Circle()
+                    .strokeBorder(.white, lineWidth: 3)
+                    .frame(width: 56, height: 56)
+                if viewModel.camera.isRecording {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.red)
+                        .frame(width: 22, height: 22)
+                } else {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 28, height: 28)
+                }
+            }
+        }
+        .disabled(viewModel.captureScheduler.isCountingDown)
+        .opacity(viewModel.captureScheduler.isCountingDown ? 0.4 : 1)
+        .accessibilityLabel(viewModel.camera.isRecording ? "停止录像" : "开始录像")
+    }
+
     private var micButton: some View {
         Button {
             viewModel.toggleListening()
         } label: {
             Image(systemName: viewModel.isListening ? "mic.fill" : "mic.slash.fill")
-                .font(.title)
+                .font(.title2)
                 .foregroundStyle(.white)
-                .frame(width: 72, height: 72)
+                .frame(width: 56, height: 56)
                 .background(viewModel.isListening ? Color.red : Color.black.opacity(0.55), in: Circle())
                 .overlay {
                     if viewModel.isListening {
                         Circle()
-                            .stroke(Color.red.opacity(0.4), lineWidth: 6)
-                            .scaleEffect(1.2)
+                            .stroke(Color.red.opacity(0.4), lineWidth: 5)
+                            .scaleEffect(1.15)
                     }
                 }
         }
+        .disabled(viewModel.camera.isRecording)
+        .opacity(viewModel.camera.isRecording ? 0.35 : 1)
+        .accessibilityLabel("语音控制")
     }
 
     // MARK: - 权限提示
