@@ -24,6 +24,17 @@ final class AskCameraViewModel: ObservableObject {
     @Published var voiceFeedbackEnabled = false
     @Published private(set) var openVocabularyReady = false
 
+    /// 调试模式：显示所有候选框、分数与各环节耗时。
+    @Published var debugMode = false
+    @Published var debugBoxes: [DebugBox] = []
+
+    struct DebugBox: Identifiable {
+        let id = UUID()
+        /// 视图坐标系下的候选框。
+        let rect: CGRect
+        let caption: String
+    }
+
     struct FocusHighlight: Identifiable, Equatable {
         let id = UUID()
         /// 视图坐标系下的高亮区域。
@@ -51,9 +62,10 @@ final class AskCameraViewModel: ObservableObject {
                 self.handleTrackingUpdate(update)
             }
         }
-        // 模型加载放后台，避免阻塞首帧（暖启动）
+        // 模型加载 + 预热放后台，避免阻塞首帧；预热触发 ANE 图编译，消除首次对焦的冷启动
         Task.detached(priority: .userInitiated) { [weak self] in
             let detector = YOLOWorldDetector.loadFromBundle()
+            await detector?.warmUp()
             await MainActor.run {
                 self?.yoloDetector = detector
                 self?.openVocabularyReady = detector != nil
@@ -137,14 +149,43 @@ final class AskCameraViewModel: ObservableObject {
         }
 
         do {
+            let start = CACurrentMediaTime()
             let candidates = try await findCandidates(for: intent, in: frame)
+            let elapsedMs = (CACurrentMediaTime() - start) * 1000
+
+            if debugMode {
+                updateDebugBoxes(with: candidates)
+            }
+
             guard let chosen = choose(from: candidates, hint: intent.spatialHint) else {
-                statusText = "画面中未找到\u{201C}\(displayName)\u{201D}"
+                statusText = debugMode
+                    ? "画面中未找到\u{201C}\(displayName)\u{201D}（检测 \(Int(elapsedMs))ms）"
+                    : "画面中未找到\u{201C}\(displayName)\u{201D}"
                 return
             }
-            focusOnDetection(chosen, displayName: displayName)
+            focusOnDetection(chosen, displayName: displayName,
+                             detectionMs: debugMode ? elapsedMs : nil)
         } catch {
             statusText = "检测失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 调试模式：把本次所有候选框画到预览上（5 秒后自动清除）。
+    private func updateDebugBoxes(with candidates: [DetectionResult]) {
+        guard let layer = camera.previewLayer else { return }
+        debugBoxes = candidates.map { result in
+            let box = result.boundingBox
+            let metadataRect = CGRect(x: box.origin.x,
+                                      y: 1 - box.origin.y - box.height,
+                                      width: box.width,
+                                      height: box.height)
+            let layerRect = layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+            return DebugBox(rect: layerRect,
+                            caption: "\(result.label) \(Int(result.confidence * 100))%")
+        }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            self?.debugBoxes = []
         }
     }
 
@@ -182,14 +223,19 @@ final class AskCameraViewModel: ObservableObject {
     }
 
     /// 将 Vision 归一化框（左下原点）转换为设备对焦点并执行对焦，随后启动焦点跟随。
-    private func focusOnDetection(_ result: DetectionResult, displayName: String) {
+    private func focusOnDetection(_ result: DetectionResult, displayName: String,
+                                  detectionMs: Double? = nil) {
         guard let layerRect = focusCamera(onVisionRect: result.boundingBox) else { return }
 
         trackedLabel = displayName
         tracker.start(with: result.boundingBox)
 
         showHighlight(rect: layerRect, label: displayName, autoDismiss: false)
-        statusText = "已对焦并跟踪：\(displayName)（置信度 \(String(format: "%.0f%%", result.confidence * 100))）"
+        var status = "已对焦并跟踪：\(displayName)（置信度 \(String(format: "%.0f%%", result.confidence * 100))）"
+        if let detectionMs {
+            status += "（检测 \(Int(detectionMs))ms）"
+        }
+        statusText = status
         speakFeedback("已对焦到\(displayName)")
     }
 

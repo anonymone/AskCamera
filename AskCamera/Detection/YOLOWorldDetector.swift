@@ -68,6 +68,27 @@ actor YOLOWorldDetector: ObjectDetecting {
         self.tokenizer = tokenizer
     }
 
+    // MARK: - 预热
+
+    /// 启动时做一次假推理，触发 Core ML 的 ANE 图编译，
+    /// 避免首次语音对焦时吃掉数秒的冷启动延迟。
+    func warmUp() async {
+        do {
+            let txtFeats = try encodeTextIfNeeded("object")
+            if imageArray == nil {
+                imageArray = try MLMultiArray(shape: [1, 3, inputSize as NSNumber, inputSize as NSNumber],
+                                              dataType: .float32)
+            }
+            let input = try MLDictionaryFeatureProvider(dictionary: [
+                "image": imageArray!,
+                "txt_feats": txtFeats,
+            ])
+            _ = try await visualModel.prediction(from: input)
+        } catch {
+            print("[YOLOWorldDetector] 预热失败: \(error)")
+        }
+    }
+
     // MARK: - ObjectDetecting
 
     /// 返回按置信度降序的候选框（Vision 归一化坐标，左下原点）。
@@ -178,14 +199,16 @@ actor YOLOWorldDetector: ObjectDetecting {
             imageArray = try MLMultiArray(shape: [1, 3, inputSize as NSNumber, inputSize as NSNumber],
                                           dataType: .float32)
         }
+        // vDSP 向量化：RGBX 交错 UInt8 → 平面 Float CHW，0~1。
+        // 逐像素 Swift 循环在 Debug 构建下慢一个数量级，这里改为跨步批量转换。
         let dst = imageArray!.dataPointer.bindMemory(to: Float32.self, capacity: 3 * inputSize * inputSize)
         let src = pixels.bindMemory(to: UInt8.self, capacity: inputSize * inputSize * 4)
         let hw = inputSize * inputSize
-        let inv: Float = 1.0 / 255.0
-        for i in 0..<hw {
-            dst[0 * hw + i] = Float(src[i * 4 + 0]) * inv
-            dst[1 * hw + i] = Float(src[i * 4 + 1]) * inv
-            dst[2 * hw + i] = Float(src[i * 4 + 2]) * inv
+        var inv: Float = 1.0 / 255.0
+        for channel in 0..<3 {
+            let plane = dst + channel * hw
+            vDSP_vfltu8(src + channel, 4, plane, 1, vDSP_Length(hw))
+            vDSP_vsmul(plane, 1, &inv, plane, 1, vDSP_Length(hw))
         }
 
         return (imageArray!, imgW, imgH, Float(padX), Float(padY), scale)

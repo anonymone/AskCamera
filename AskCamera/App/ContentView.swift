@@ -14,6 +14,10 @@ struct ContentView: View {
                 permissionDeniedOverlay
             }
 
+            if viewModel.debugMode {
+                debugBoxesOverlay
+            }
+
             focusHighlightOverlay
 
             VStack {
@@ -45,6 +49,26 @@ struct ContentView: View {
                 }
                 .transition(.scale(scale: 1.3).combined(with: .opacity))
                 .animation(.spring(duration: 0.25), value: viewModel.focusHighlight)
+        }
+    }
+
+    // MARK: - 调试候选框
+
+    private var debugBoxesOverlay: some View {
+        ForEach(viewModel.debugBoxes) { box in
+            Rectangle()
+                .stroke(Color.green.opacity(0.8), lineWidth: 1)
+                .frame(width: box.rect.width, height: box.rect.height)
+                .position(x: box.rect.midX, y: box.rect.midY)
+                .overlay(alignment: .topLeading) {
+                    Text(box.caption)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(.green.opacity(0.8))
+                        .foregroundStyle(.black)
+                        .position(x: box.rect.minX + 40, y: box.rect.minY - 8)
+                }
         }
     }
 
@@ -83,9 +107,12 @@ struct ContentView: View {
 
                 micButton
 
-                // 占位保持麦克风居中
-                Image(systemName: "speaker.wave.2")
-                    .opacity(0)
+                Toggle(isOn: $viewModel.debugMode) {
+                    Image(systemName: "ladybug")
+                }
+                .toggleStyle(.button)
+                .tint(.green)
+                .foregroundStyle(.white)
             }
         }
         .padding(.bottom, 30)
