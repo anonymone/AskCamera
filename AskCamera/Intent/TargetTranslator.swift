@@ -64,22 +64,28 @@ enum TargetTranslator {
         return (mutable as String).replacingOccurrences(of: " ", with: "")
     }
 
+    /// 同步词典/拼音查找（不含端模型）。命中则返回英文小写名词。
+    static func lookup(_ target: String) -> String? {
+        let trimmed = target.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.allSatisfy(\.isASCII) {
+            return trimmed.lowercased()
+        }
+        if let hit = dictionary[trimmed] {
+            return hit
+        }
+        if let hit = pinyinIndex[pinyin(of: trimmed)] {
+            return hit
+        }
+        return nil
+    }
+
     /// 翻译目标词为 CLIP 可用的英文。全程端侧。
     static func translate(_ target: String) async -> String {
         let trimmed = target.trimmingCharacters(in: .whitespaces)
 
-        // 已经是 ASCII（英文输入）：原样返回
-        if trimmed.allSatisfy({ $0.isASCII }) {
-            return trimmed.lowercased()
-        }
-
-        // 词典精确命中
-        if let hit = dictionary[trimmed] {
-            return hit
-        }
-
-        // 拼音层命中（容忍同音字误识别，如"平果"→"苹果"→apple）
-        if let hit = pinyinIndex[pinyin(of: trimmed)] {
+        if let hit = lookup(trimmed) {
             return hit
         }
 

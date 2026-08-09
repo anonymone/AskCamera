@@ -35,8 +35,9 @@ actor YOLOWorldDetector: ObjectDetecting {
     var confidenceThreshold: Float = 0.15
     private let nmsIoUThreshold: Float = 0.45
 
-    private var cachedTarget: String?
+    private var cachedPromptKey: String?
     private var cachedTxtFeats: MLMultiArray?
+    private var cachedPromptCount: Int = 0
     /// 双缓冲：ANE 可能仍持有上一轮输入，原地改同一 MLMultiArray 会导致后续推理逐渐偏移。
     private var imageSlots: [MLMultiArray?] = [nil, nil]
     private var imageSlotIndex = 0
@@ -76,7 +77,7 @@ actor YOLOWorldDetector: ObjectDetecting {
     /// 避免首次语音对焦时吃掉数秒的冷启动延迟。
     func warmUp() async {
         do {
-            let txtFeats = try encodeTextIfNeeded("object")
+            let txtFeats = try encodeTextIfNeeded(["object"])
             let image = try nextImageTensor()
             let input = try MLDictionaryFeatureProvider(dictionary: [
                 "image": image,
@@ -93,8 +94,17 @@ actor YOLOWorldDetector: ObjectDetecting {
     /// 返回按置信度降序的候选框（Vision 归一化坐标，左下原点）。
     func detect(target: String?, in pixelBuffer: CVPixelBuffer) async throws -> [DetectionResult] {
         guard let target, !target.isEmpty else { return [] }
+        return try await detect(prompts: [target], label: target, in: pixelBuffer)
+    }
 
-        let txtFeats = try encodeTextIfNeeded(target)
+    /// 使用多个英文 prompt（写入不同类别槽位，锚点取 max score）。
+    func detect(prompts: [String], label: String, in pixelBuffer: CVPixelBuffer) async throws -> [DetectionResult] {
+        let cleaned = prompts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return [] }
+
+        let txtFeats = try encodeTextIfNeeded(cleaned)
         let (tensor, imgW, imgH, padX, padY, scale) = try preprocess(pixelBuffer)
 
         let input = try MLDictionaryFeatureProvider(dictionary: [
@@ -108,26 +118,33 @@ actor YOLOWorldDetector: ObjectDetecting {
             throw YOLOWorldError.predictionFailed
         }
 
-        return decode(boxes: boxesMA, scores: scoresMA, target: target,
+        return decode(boxes: boxesMA, scores: scoresMA, label: label,
+                      promptCount: min(cleaned.count, maxClasses),
                       imgW: imgW, imgH: imgH, padX: padX, padY: padY, scale: scale)
     }
 
     // MARK: - 文本编码（带缓存）
 
-    private func encodeTextIfNeeded(_ target: String) throws -> MLMultiArray {
-        if target == cachedTarget, let cached = cachedTxtFeats {
+    /// 多个 prompt 写入 CLIP token 矩阵不同行，一次前向得到全部 embedding。
+    private func encodeTextIfNeeded(_ prompts: [String]) throws -> MLMultiArray {
+        let key = prompts.joined(separator: "\u{1f}")
+        if key == cachedPromptKey, let cached = cachedTxtFeats {
             return cached
         }
 
-        // token 输入 [80, 77]：目标词占第 0 行，其余行全 0
+        let promptCount = min(prompts.count, maxClasses)
         let tokenArray = try MLMultiArray(shape: [maxClasses as NSNumber, tokenizer.contextLength as NSNumber],
                                           dataType: .int32)
         let tokenPtr = tokenArray.dataPointer.bindMemory(to: Int32.self,
                                                          capacity: maxClasses * tokenizer.contextLength)
         memset(tokenPtr, 0, maxClasses * tokenizer.contextLength * MemoryLayout<Int32>.size)
-        let tokens = tokenizer.tokenize(target)
-        for j in 0..<tokenizer.contextLength {
-            tokenPtr[j] = Int32(tokens[j])
+
+        for i in 0..<promptCount {
+            let tokens = tokenizer.tokenize(prompts[i])
+            let row = tokenPtr + i * tokenizer.contextLength
+            for j in 0..<tokenizer.contextLength {
+                row[j] = Int32(tokens[j])
+            }
         }
 
         let encoderInput = try MLDictionaryFeatureProvider(dictionary: ["text_tokens": tokenArray])
@@ -136,30 +153,34 @@ actor YOLOWorldDetector: ObjectDetecting {
             throw YOLOWorldError.predictionFailed
         }
 
-        // 取第 0 行 embedding，L2 归一化后写入 txt_feats [1, 80, 512]
-        var embedding = [Float](repeating: 0, count: embeddingDim)
         let embPtr = embeddings.dataPointer.bindMemory(to: Float32.self, capacity: embeddings.count)
-        for j in 0..<embeddingDim {
-            embedding[j] = embPtr[j]
-        }
-        var norm: Float = 0
-        vDSP_svesq(embedding, 1, &norm, vDSP_Length(embeddingDim))
-        norm = sqrt(norm)
-        if norm > 1e-8 {
-            var s = 1.0 / norm
-            vDSP_vsmul(embedding, 1, &s, &embedding, 1, vDSP_Length(embeddingDim))
-        }
-
         let txtFeats = try MLMultiArray(shape: [1, maxClasses as NSNumber, embeddingDim as NSNumber],
                                         dataType: .float32)
         let featPtr = txtFeats.dataPointer.bindMemory(to: Float32.self, capacity: maxClasses * embeddingDim)
         memset(featPtr, 0, maxClasses * embeddingDim * MemoryLayout<Float32>.size)
-        for j in 0..<embeddingDim {
-            featPtr[j] = embedding[j]
+
+        var embedding = [Float](repeating: 0, count: embeddingDim)
+        for i in 0..<promptCount {
+            let src = embPtr + i * embeddingDim
+            for j in 0..<embeddingDim {
+                embedding[j] = src[j]
+            }
+            var norm: Float = 0
+            vDSP_svesq(embedding, 1, &norm, vDSP_Length(embeddingDim))
+            norm = sqrt(norm)
+            if norm > 1e-8 {
+                var s = 1.0 / norm
+                vDSP_vsmul(embedding, 1, &s, &embedding, 1, vDSP_Length(embeddingDim))
+            }
+            let dst = featPtr + i * embeddingDim
+            for j in 0..<embeddingDim {
+                dst[j] = embedding[j]
+            }
         }
 
-        cachedTarget = target
+        cachedPromptKey = key
         cachedTxtFeats = txtFeats
+        cachedPromptCount = promptCount
         return txtFeats
     }
 
@@ -227,18 +248,35 @@ actor YOLOWorldDetector: ObjectDetecting {
     // MARK: - 解码 + NMS
 
     private func decode(boxes boxesMA: MLMultiArray, scores scoresMA: MLMultiArray,
-                        target: String,
+                        label: String, promptCount: Int,
                         imgW: Int, imgH: Int, padX: Float, padY: Float, scale: Float) -> [DetectionResult] {
         let boxes = boxesMA.dataPointer.bindMemory(to: Float32.self, capacity: boxesMA.count)
         let scores = scoresMA.dataPointer.bindMemory(to: Float32.self, capacity: scoresMA.count)
         let shape = scoresMA.shape.map { $0.intValue }
-        let numAnchors = shape.count >= 3 ? shape[2] : 8400
+        // scores 布局：[1, numClasses, numAnchors] 或 [numClasses, numAnchors]
+        let numAnchors: Int
+        let numClasses: Int
+        if shape.count >= 3 {
+            numClasses = shape[shape.count - 2]
+            numAnchors = shape[shape.count - 1]
+        } else if shape.count == 2 {
+            numClasses = shape[0]
+            numAnchors = shape[1]
+        } else {
+            numClasses = max(1, promptCount)
+            numAnchors = 8400
+        }
+        let activeClasses = max(1, min(promptCount, numClasses,
+                                       cachedPromptCount > 0 ? cachedPromptCount : promptCount))
 
-        // 目标词在类别槽位 0，只读第 0 通道的分数。
         var candidates: [(CGRect, Float)] = []
         for a in 0..<numAnchors {
-            let score = scores[a]
-            guard score >= confidenceThreshold else { continue }
+            var bestScore: Float = 0
+            for c in 0..<activeClasses {
+                let score = scores[c * numAnchors + a]
+                if score > bestScore { bestScore = score }
+            }
+            guard bestScore >= confidenceThreshold else { continue }
 
             let cx = boxes[0 * numAnchors + a]
             let cy = boxes[1 * numAnchors + a]
@@ -255,7 +293,7 @@ actor YOLOWorldDetector: ObjectDetecting {
                               y: CGFloat(max(0, min(1, ny))),
                               width: CGFloat(max(0, min(1, nw))),
                               height: CGFloat(max(0, min(1, nh))))
-            candidates.append((rect, score))
+            candidates.append((rect, bestScore))
         }
 
         // NMS：保留互不重叠的候选，支持画面中同类多实例（配合方位修饰选择）
@@ -275,7 +313,7 @@ actor YOLOWorldDetector: ObjectDetecting {
                                     y: 1 - rect.origin.y - rect.height,
                                     width: rect.width,
                                     height: rect.height)
-            return DetectionResult(boundingBox: visionRect, label: target, confidence: score)
+            return DetectionResult(boundingBox: visionRect, label: label, confidence: score)
         }
     }
 

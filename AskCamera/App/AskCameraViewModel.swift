@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 /// 感知-决策-执行流水线的协调者：
-/// 语音(SpeechAnalyzer) → 意图(FocusIntentParser) → 翻译(TargetTranslator)
+/// 语音(SpeechAnalyzer) → 查询理解(QueryUnderstanding → DetectionQuery)
 /// → 检测(YOLO-World / 显著性兜底) → 对焦(CameraManager)。
 @MainActor
 final class AskCameraViewModel: ObservableObject {
@@ -59,7 +59,7 @@ final class AskCameraViewModel: ObservableObject {
 
     /// volatile 快路径状态：未定稿文本解析出完整指令并稳定 400ms 即执行，final 到达时去重。
     private var volatileCommandTask: Task<Void, Never>?
-    private var lastExecutedCommand: FocusCommand?
+    private var lastExecutedQuery: DetectionQuery?
     private var lastExecutedAt: TimeInterval = 0
 
     /// 跟踪节流状态。
@@ -93,6 +93,8 @@ final class AskCameraViewModel: ObservableObject {
                 }
             }
         }
+        // 查询理解端模型预热（无 Apple Intelligence 时内部直接返回）
+        QueryUnderstanding.warmUp()
     }
 
     // MARK: - 语音控制
@@ -191,11 +193,18 @@ final class AskCameraViewModel: ObservableObject {
 
     /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
     /// 不等定稿（定稿往往滞后 1~2 秒）。文本再变化会重置计时。
+    /// 仅走规则+词典，不调用端模型（半句/延迟敏感）。
     private func scheduleVolatileCommand(from text: String) {
         guard let command = FocusIntentParser.parseCommand(text) else { return }
         // 无目标的裸"对焦"只在定稿时执行：说到一半的"对焦到……"会被暂时解析成
         // 无目标指令，快路径执行会误触发显著性对焦
         if case .focus(let intent) = command, intent.target == nil {
+            return
+        }
+        // 词典未命中的复杂目标留给 final + 端模型，避免用错误英文 prompt 抢跑
+        if case .focus(let intent) = command, let target = intent.target,
+           TargetTranslator.lookup(target) == nil,
+           !target.allSatisfy(\.isASCII) {
             return
         }
         volatileCommandTask?.cancel()
@@ -207,43 +216,46 @@ final class AskCameraViewModel: ObservableObject {
     }
 
     private func handleTranscript(_ text: String, isFinal: Bool) async {
-        guard let command = FocusIntentParser.parseCommand(text) else {
+        // volatile：禁用端模型；final：允许 Foundation Models 结构化理解
+        guard let query = await QueryUnderstanding.resolve(text, allowLanguageModel: isFinal) else {
             if isFinal {
                 statusText = "\u{201C}\(text)\u{201D}（未识别为对焦指令）"
             }
             return
         }
+        if query.action == .none { return }
 
-        // volatile 与 final 去重：相同指令 3 秒内只执行一次
+        // volatile 与 final 去重：相同查询 3 秒内只执行一次
         let now = CACurrentMediaTime()
-        if command == lastExecutedCommand, now - lastExecutedAt < 3 {
+        if query == lastExecutedQuery, now - lastExecutedAt < 3 {
             return
         }
-        lastExecutedCommand = command
+        lastExecutedQuery = query
         lastExecutedAt = now
 
-        await execute(command)
+        await execute(query)
         consumeTranscript(text)
     }
 
-    private func execute(_ command: FocusCommand) async {
+    private func execute(_ query: DetectionQuery) async {
         // 新指令先停掉旧跟踪，避免检测耗时期间旧框继续写 highlight。
         tracker.stop()
         trackingGeneration = 0
 
-        let intent: FocusIntent
-        switch command {
+        switch query.action {
+        case .none:
+            return
         case .reset:
             focusHighlight = nil
             camera.resetFocusToCenter()
             statusText = "已恢复自动对焦"
             speakFeedback("已恢复自动对焦")
             return
-        case .focus(let focusIntent):
-            intent = focusIntent
+        case .focus:
+            break
         }
 
-        let displayName = intent.target ?? "显著物体"
+        let displayName = query.displayName.isEmpty ? "显著物体" : query.displayName
         statusText = "正在寻找：\(displayName)"
 
         guard let frame = camera.latestFrame() else {
@@ -253,14 +265,14 @@ final class AskCameraViewModel: ObservableObject {
 
         do {
             let start = CACurrentMediaTime()
-            let candidates = try await findCandidates(for: intent, in: frame)
+            let candidates = try await findCandidates(for: query, in: frame)
             let elapsedMs = (CACurrentMediaTime() - start) * 1000
 
             if debugMode {
                 updateDebugBoxes(with: candidates)
             }
 
-            guard let chosen = choose(from: candidates, hint: intent.spatialHint) else {
+            guard let chosen = choose(from: candidates, hint: query.spatialHint) else {
                 statusText = debugMode
                     ? "画面中未找到\u{201C}\(displayName)\u{201D}（检测 \(Int(elapsedMs))ms）"
                     : "画面中未找到\u{201C}\(displayName)\u{201D}"
@@ -286,19 +298,19 @@ final class AskCameraViewModel: ObservableObject {
         }
     }
 
-    /// 有目标词且 YOLO-World 可用走开放词汇检测，否则显著性兜底。
-    private func findCandidates(for intent: FocusIntent,
+    /// 有 YOLO prompts 且模型可用走开放词汇检测，否则显著性兜底。
+    private func findCandidates(for query: DetectionQuery,
                                 in frame: CVPixelBuffer) async throws -> [DetectionResult] {
-        if let target = intent.target, let yolo = yoloDetector {
-            let englishTarget = await TargetTranslator.translate(target)
-            let results = try await yolo.detect(target: englishTarget, in: frame)
+        if !query.useSaliency, !query.yoloPrompts.isEmpty, let yolo = yoloDetector {
+            let label = query.yoloPrompts.first ?? query.displayName
+            let results = try await yolo.detect(prompts: query.yoloPrompts, label: label, in: frame)
             if !results.isEmpty {
                 return results
             }
             // 开放词汇没找到时不静默降级——用户点名的目标不在画面里就该如实报告
             return []
         }
-        return try await salientDetector.detect(target: intent.target, in: frame)
+        return try await salientDetector.detect(target: query.displayName, in: frame)
     }
 
     /// 按方位修饰从候选中选择；无修饰时取置信度最高者。

@@ -12,13 +12,13 @@
 麦克风 ──► SpeechAnalyzer (iOS 26 端侧流式 ASR)
               │ 定稿文本
               ▼
-        FocusIntentParser (规则快路径，提取目标词 + 方位修饰)
-              │ FocusIntent(target: "苹果", spatialHint: .left)
+        QueryUnderstanding
+              │ 规则快筛（分句 / 触发词 / 取消）
+              │ 简单目标：词典/拼音 → DetectionQuery
+              │ 复杂指代：Foundation Models @Generable → DetectionQuery
+              │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
               ▼
-        TargetTranslator (中→英：词典 / Foundation Models，端侧)
-              │ "apple"
-              ▼
-相机帧 ──► YOLO-World V2 (Core ML 开放词汇检测，任意目标词)
+相机帧 ──► YOLO-World V2 (Core ML，多英文 prompt 槽位)
               │ 候选框列表（未随包分发模型时降级为 Vision 显著性检测）
               ▼
         方位选择 → 坐标转换 (Vision → 预览层 → 设备坐标)
@@ -41,7 +41,7 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 |---|---|
 | `AskCamera/Camera` | `AVCaptureSession` 采集、预览、点击对焦、`focusPointOfInterest` 控制 |
 | `AskCamera/Speech` | 基于 iOS 26 `SpeechAnalyzer`/`SpeechTranscriber` 的端侧流式语音识别 |
-| `AskCamera/Intent` | 规则式指令解析（中英文句式、方位修饰）+ 目标词端侧翻译 |
+| `AskCamera/Intent` | 查询理解（规则快筛 + 词典 + Foundation Models 结构化 `DetectionQuery`） |
 | `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底 |
 | `AskCamera/App` | SwiftUI 界面与流水线协调（`AskCameraViewModel`） |
 
@@ -50,7 +50,7 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 - [x] 阶段一：相机预览 + 点击对焦 + 语音链路（ASR → 意图 → 显著物体对焦）
 - [x] 阶段二：YOLO-World V2 开放词汇检测（Core ML，任意目标词匹配 + 方位修饰选择）
 - [x] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标（节流对焦、跟丢自动复位）
-- [ ] 阶段四：Foundation Models 复杂指令解析（"封面蓝色的那本书"）
+- [x] 阶段四：Foundation Models 查询理解（结构化 `DetectionQuery` → YOLO prompts；简单路径仍走词典）
 - [ ] 阶段五：FastVLM 指代消歧、LiDAR 深度辅助
 
 ## 构建
