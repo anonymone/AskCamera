@@ -37,7 +37,9 @@ actor YOLOWorldDetector: ObjectDetecting {
 
     private var cachedTarget: String?
     private var cachedTxtFeats: MLMultiArray?
-    private var imageArray: MLMultiArray?
+    /// 双缓冲：ANE 可能仍持有上一轮输入，原地改同一 MLMultiArray 会导致后续推理逐渐偏移。
+    private var imageSlots: [MLMultiArray?] = [nil, nil]
+    private var imageSlotIndex = 0
 
     // MARK: - 加载
 
@@ -75,12 +77,9 @@ actor YOLOWorldDetector: ObjectDetecting {
     func warmUp() async {
         do {
             let txtFeats = try encodeTextIfNeeded("object")
-            if imageArray == nil {
-                imageArray = try MLMultiArray(shape: [1, 3, inputSize as NSNumber, inputSize as NSNumber],
-                                              dataType: .float32)
-            }
+            let image = try nextImageTensor()
             let input = try MLDictionaryFeatureProvider(dictionary: [
-                "image": imageArray!,
+                "image": image,
                 "txt_feats": txtFeats,
             ])
             _ = try await visualModel.prediction(from: input)
@@ -187,6 +186,9 @@ actor YOLOWorldDetector: ObjectDetecting {
                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
             throw YOLOWorldError.preprocessFailed
         }
+        // iOS 位图上下文内存首行就是画面顶部，与 CVPixelBuffer / YOLO 一致。
+        // 不要再 translate+scale(1,-1)：那会把图上下颠倒送进模型，
+        // 上方物体的检出框会被画到屏幕底部。
         ctx.setFillColor(gray: 0.5, alpha: 1.0)
         ctx.fill(CGRect(x: 0, y: 0, width: inputSize, height: inputSize))
         ctx.draw(cgImage, in: CGRect(x: padX, y: padY, width: scaledW, height: scaledH))
@@ -195,13 +197,10 @@ actor YOLOWorldDetector: ObjectDetecting {
             throw YOLOWorldError.preprocessFailed
         }
 
-        if imageArray == nil {
-            imageArray = try MLMultiArray(shape: [1, 3, inputSize as NSNumber, inputSize as NSNumber],
-                                          dataType: .float32)
-        }
+        let imageArray = try nextImageTensor()
         // vDSP 向量化：RGBX 交错 UInt8 → 平面 Float CHW，0~1。
         // 逐像素 Swift 循环在 Debug 构建下慢一个数量级，这里改为跨步批量转换。
-        let dst = imageArray!.dataPointer.bindMemory(to: Float32.self, capacity: 3 * inputSize * inputSize)
+        let dst = imageArray.dataPointer.bindMemory(to: Float32.self, capacity: 3 * inputSize * inputSize)
         let src = pixels.bindMemory(to: UInt8.self, capacity: inputSize * inputSize * 4)
         let hw = inputSize * inputSize
         var inv: Float = 1.0 / 255.0
@@ -211,7 +210,18 @@ actor YOLOWorldDetector: ObjectDetecting {
             vDSP_vsmul(plane, 1, &inv, plane, 1, vDSP_Length(hw))
         }
 
-        return (imageArray!, imgW, imgH, Float(padX), Float(padY), scale)
+        return (imageArray, imgW, imgH, Float(padX), Float(padY), scale)
+    }
+
+    private func nextImageTensor() throws -> MLMultiArray {
+        imageSlotIndex = 1 - imageSlotIndex
+        if let existing = imageSlots[imageSlotIndex] {
+            return existing
+        }
+        let created = try MLMultiArray(shape: [1, 3, inputSize as NSNumber, inputSize as NSNumber],
+                                       dataType: .float32)
+        imageSlots[imageSlotIndex] = created
+        return created
     }
 
     // MARK: - 解码 + NMS

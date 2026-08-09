@@ -12,6 +12,11 @@ struct CameraPreviewView: UIViewRepresentable {
         let view = PreviewUIView()
         view.videoPreviewLayer.session = camera.session
         view.videoPreviewLayer.videoGravity = .resizeAspectFill
+        // 与 VideoDataOutput 同为竖屏 90°，转换 API 才与画面方向一致。
+        if let connection = view.videoPreviewLayer.connection,
+           connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
         camera.previewLayer = view.videoPreviewLayer
 
         let tap = UITapGestureRecognizer(target: context.coordinator,

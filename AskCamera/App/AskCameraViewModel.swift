@@ -42,13 +42,17 @@ final class AskCameraViewModel: ObservableObject {
         let label: String
     }
 
-    /// 实时字幕：定稿历史（保留最近 3 行）。
+    /// 实时字幕：尚未被指令消费的定稿行。
     @Published var captionHistory: [CaptionLine] = []
 
     struct CaptionLine: Identifiable, Equatable {
         let id = UUID()
         let text: String
     }
+
+    /// 已执行指令对应的转写原文。后续字幕只显示这段之后的新内容，
+    /// 避免 SpeechAnalyzer 连续会话把上一句拼进下一句。
+    private var consumedTranscript = ""
 
     private var listeningTask: Task<Void, Never>?
     private var highlightDismissTask: Task<Void, Never>?
@@ -63,6 +67,8 @@ final class AskCameraViewModel: ObservableObject {
     private var lastRefocusCenter: CGPoint = .zero
     private var lastRefocusTime: TimeInterval = 0
     private var lastHighlightTime: TimeInterval = 0
+    /// 与 FocusTracker.start 返回的世代号对齐，丢弃过期的跟踪回调。
+    private var trackingGeneration: UInt64 = 0
 
     // MARK: - 生命周期
 
@@ -106,17 +112,22 @@ final class AskCameraViewModel: ObservableObject {
                 statusText = "正在准备语音模型……"
                 let events = try await speech.start()
                 isListening = true
+                consumedTranscript = ""
                 captionHistory = []
+                volatileTranscript = ""
                 statusText = "正在聆听，说\u{201C}对焦到……\u{201D}"
                 for await event in events {
                     switch event {
                     case .volatile(let text):
-                        volatileTranscript = text
+                        volatileTranscript = leftoverTranscript(from: text)
                         scheduleVolatileCommand(from: text)
                     case .final(let text):
                         volatileTranscript = ""
                         volatileCommandTask?.cancel()
-                        appendCaption(text)
+                        let leftover = leftoverTranscript(from: text)
+                        if !leftover.isEmpty {
+                            appendCaption(leftover)
+                        }
                         await handleTranscript(text, isFinal: true)
                     }
                 }
@@ -133,17 +144,49 @@ final class AskCameraViewModel: ObservableObject {
         Task { await speech.stop() }
         isListening = false
         volatileTranscript = ""
+        captionHistory = []
+        consumedTranscript = ""
         statusText = "已停止聆听"
     }
 
     // MARK: - 指令处理
 
-    /// 定稿字幕历史，保留最近 3 行。
+    private static let captionTrimCharacters = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+        .union(CharacterSet(charactersIn: "。！？、，,.!?"))
+
+    /// 定稿字幕，保留最近 3 行；指令执行后会整表清空。
     private func appendCaption(_ text: String) {
-        captionHistory.append(CaptionLine(text: text))
+        let trimmed = text.trimmingCharacters(in: Self.captionTrimCharacters)
+        guard !trimmed.isEmpty else { return }
+        captionHistory.append(CaptionLine(text: trimmed))
         if captionHistory.count > 3 {
             captionHistory.removeFirst(captionHistory.count - 3)
         }
+    }
+
+    /// 去掉已执行指令对应的前缀，只留下尚未消费的新句子。
+    private func leftoverTranscript(from full: String) -> String {
+        let consumed = consumedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !consumed.isEmpty else {
+            return full.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if full.hasPrefix(consumed) {
+            return String(full.dropFirst(consumed.count))
+                .trimmingCharacters(in: Self.captionTrimCharacters)
+        }
+        if let range = full.range(of: consumed) {
+            return String(full[range.upperBound...])
+                .trimmingCharacters(in: Self.captionTrimCharacters)
+        }
+        return full.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 指令已执行：记下已消费原文并清空字幕，下一句从空白开始。
+    private func consumeTranscript(_ text: String) {
+        consumedTranscript = text
+        captionHistory = []
+        volatileTranscript = ""
     }
 
     /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
@@ -180,13 +223,17 @@ final class AskCameraViewModel: ObservableObject {
         lastExecutedAt = now
 
         await execute(command)
+        consumeTranscript(text)
     }
 
     private func execute(_ command: FocusCommand) async {
+        // 新指令先停掉旧跟踪，避免检测耗时期间旧框继续写 highlight。
+        tracker.stop()
+        trackingGeneration = 0
+
         let intent: FocusIntent
         switch command {
         case .reset:
-            tracker.stop()
             focusHighlight = nil
             camera.resetFocusToCenter()
             statusText = "已恢复自动对焦"
@@ -278,7 +325,7 @@ final class AskCameraViewModel: ObservableObject {
         guard let layerRect = focusCamera(onVisionRect: result.boundingBox) else { return }
 
         trackedLabel = displayName
-        tracker.start(with: result.boundingBox)
+        trackingGeneration = tracker.start(with: result.boundingBox)
 
         showHighlight(rect: layerRect, label: displayName, autoDismiss: false)
         var status = "已对焦并跟踪：\(displayName)（置信度 \(String(format: "%.0f%%", result.confidence * 100))）"
@@ -308,12 +355,14 @@ final class AskCameraViewModel: ObservableObject {
 
     private func handleTrackingUpdate(_ update: FocusTracker.Update) {
         switch update {
-        case .lost:
+        case .lost(let generation):
+            guard generation == trackingGeneration else { return }
             focusHighlight = nil
             statusText = "\u{201C}\(trackedLabel)\u{201D}已离开画面，恢复自动对焦"
             camera.resetFocusToCenter()
 
-        case .tracking(let box):
+        case .tracking(let box, let generation):
+            guard generation == trackingGeneration else { return }
             let now = CACurrentMediaTime()
             let center = CGPoint(x: box.midX, y: box.midY)
             let moved = hypot(center.x - lastRefocusCenter.x, center.y - lastRefocusCenter.y)
@@ -338,6 +387,7 @@ final class AskCameraViewModel: ObservableObject {
         guard let layer = camera.previewLayer else { return }
         // 手动点击打断跟踪
         tracker.stop()
+        trackingGeneration = 0
         let devicePoint = layer.captureDevicePointConverted(fromLayerPoint: viewPoint)
         camera.focus(atDevicePoint: devicePoint)
 

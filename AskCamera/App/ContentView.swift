@@ -5,20 +5,24 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            CameraPreviewView(camera: viewModel.camera) { point in
-                viewModel.handleTap(at: point)
+            // 预览与对焦框必须共用同一全屏坐标系，否则 layerRect 相对预览层、
+            // SwiftUI overlay 却从安全区顶边起算，框会整体下移。
+            ZStack {
+                CameraPreviewView(camera: viewModel.camera) { point in
+                    viewModel.handleTap(at: point)
+                }
+
+                if viewModel.debugMode {
+                    debugBoxesOverlay
+                }
+
+                focusHighlightOverlay
             }
             .ignoresSafeArea()
 
             if viewModel.camera.authorizationDenied {
                 permissionDeniedOverlay
             }
-
-            if viewModel.debugMode {
-                debugBoxesOverlay
-            }
-
-            focusHighlightOverlay
 
             VStack {
                 statusBar
@@ -33,43 +37,47 @@ struct ContentView: View {
 
     @ViewBuilder
     private var focusHighlightOverlay: some View {
-        if let highlight = viewModel.focusHighlight {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.yellow, lineWidth: 2)
-                .frame(width: highlight.rect.width, height: highlight.rect.height)
-                .position(x: highlight.rect.midX, y: highlight.rect.midY)
-                .overlay(alignment: .top) {
-                    Text(highlight.label)
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(.yellow, in: Capsule())
-                        .foregroundStyle(.black)
-                        .position(x: highlight.rect.midX, y: highlight.rect.minY - 16)
-                }
-                .transition(.scale(scale: 1.3).combined(with: .opacity))
-                .animation(.spring(duration: 0.25), value: viewModel.focusHighlight)
+        ZStack {
+            if let highlight = viewModel.focusHighlight {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.yellow, lineWidth: 2)
+                    .frame(width: highlight.rect.width, height: highlight.rect.height)
+                    .position(x: highlight.rect.midX, y: highlight.rect.midY)
+                    .transition(.scale(scale: 1.3).combined(with: .opacity))
+                    .animation(.spring(duration: 0.25), value: viewModel.focusHighlight)
+
+                Text(highlight.label)
+                    .font(.caption.bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.yellow, in: Capsule())
+                    .foregroundStyle(.black)
+                    .position(x: highlight.rect.midX, y: highlight.rect.minY - 16)
+            }
         }
+        .allowsHitTesting(false)
     }
 
     // MARK: - 调试候选框
 
     private var debugBoxesOverlay: some View {
-        ForEach(viewModel.debugBoxes) { box in
-            Rectangle()
-                .stroke(Color.green.opacity(0.8), lineWidth: 1)
-                .frame(width: box.rect.width, height: box.rect.height)
-                .position(x: box.rect.midX, y: box.rect.midY)
-                .overlay(alignment: .topLeading) {
-                    Text(box.caption)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(.green.opacity(0.8))
-                        .foregroundStyle(.black)
-                        .position(x: box.rect.minX + 40, y: box.rect.minY - 8)
-                }
+        ZStack {
+            ForEach(viewModel.debugBoxes) { box in
+                Rectangle()
+                    .stroke(Color.green.opacity(0.8), lineWidth: 1)
+                    .frame(width: box.rect.width, height: box.rect.height)
+                    .position(x: box.rect.midX, y: box.rect.midY)
+
+                Text(box.caption)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(.green.opacity(0.8))
+                    .foregroundStyle(.black)
+                    .position(x: box.rect.minX + 40, y: box.rect.minY - 8)
+            }
         }
+        .allowsHitTesting(false)
     }
 
     // MARK: - 顶部状态

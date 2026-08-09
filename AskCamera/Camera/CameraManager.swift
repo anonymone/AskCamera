@@ -97,25 +97,43 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// Vision 归一化框（左下原点，相对旋转后的输出帧）→ 预览层坐标。
     ///
-    /// 关键：输出连接旋转为竖屏后，帧坐标 ≠ 元数据坐标（后者定义在未旋转的
-    /// 传感器方向上）。必须先经 metadataOutputRectConverted(fromOutputRect:)
-    /// 转回元数据空间，再交给预览层转换，否则整条链路差 90°。
+    /// VideoDataOutput 与 PreviewLayer 都固定为竖屏 90°，帧方向与预览一致，
+    /// 不必再绕元数据/传感器坐标系。按 videoGravity = resizeAspectFill
+    /// 做等比铺满 + 裁切即可。
     func layerRect(fromVisionRect box: CGRect) -> CGRect? {
         guard let layer = previewLayer else { return nil }
         frameLock.lock()
         let bufferSize = _bufferSize
         frameLock.unlock()
-        guard bufferSize != .zero else { return nil }
+        let layerSize = layer.bounds.size
+        guard bufferSize.width > 0, bufferSize.height > 0,
+              layerSize.width > 0, layerSize.height > 0 else { return nil }
 
-        // Vision（左下原点）→ 输出帧像素坐标（左上原点）
-        let outputRect = CGRect(x: box.origin.x * bufferSize.width,
-                                y: (1 - box.origin.y - box.height) * bufferSize.height,
-                                width: box.width * bufferSize.width,
-                                height: box.height * bufferSize.height)
-        // 输出帧像素坐标 → 元数据坐标（传感器空间，归一化）
-        let metadataRect = videoOutput.metadataOutputRectConverted(fromOutputRect: outputRect)
-        // 元数据坐标 → 预览层坐标
-        return layer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+        // Vision 左下 → 图像左上
+        let imageRect = CGRect(x: box.origin.x,
+                               y: 1 - box.origin.y - box.height,
+                               width: box.width,
+                               height: box.height)
+
+        let imageAspect = bufferSize.width / bufferSize.height
+        let layerAspect = layerSize.width / layerSize.height
+        let scale: CGFloat
+        let xOffset: CGFloat
+        let yOffset: CGFloat
+        if imageAspect > layerAspect {
+            scale = layerSize.height / bufferSize.height
+            xOffset = (layerSize.width - bufferSize.width * scale) / 2
+            yOffset = 0
+        } else {
+            scale = layerSize.width / bufferSize.width
+            xOffset = 0
+            yOffset = (layerSize.height - bufferSize.height * scale) / 2
+        }
+
+        return CGRect(x: imageRect.origin.x * bufferSize.width * scale + xOffset,
+                      y: imageRect.origin.y * bufferSize.height * scale + yOffset,
+                      width: imageRect.width * bufferSize.width * scale,
+                      height: imageRect.height * bufferSize.height * scale)
     }
 
     // MARK: - 对焦控制
