@@ -1,0 +1,27 @@
+name: AskCamera
+options:
+  bundleIdPrefix: com.severuspeng
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+targets:
+  AskCamera:
+    type: application
+    platform: iOS
+    sources:
+      - AskCamera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.severuspeng.AskCamera
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: "AskCamera 需要使用相机以提供实时取景与对焦。"
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "AskCamera 需要使用麦克风识别语音对焦指令，全部语音处理均在设备端完成。"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic

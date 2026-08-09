@@ -1,0 +1,18 @@
+# Xcode
+*.xcodeproj/
+!*.xcodeproj/project.xcworkspace/
+xcuserdata/
+DerivedData/
+*.xcresult
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# CoreML 大模型文件（后续通过脚本下载，不入库）
+*.mlpackage
+*.mlmodelc
