@@ -88,14 +88,7 @@ struct ContentView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 12) {
-            if !viewModel.volatileTranscript.isEmpty {
-                Text(viewModel.volatileTranscript)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.75))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(.black.opacity(0.4), in: Capsule())
-            }
+            captionPanel
 
             HStack(spacing: 28) {
                 Toggle(isOn: $viewModel.voiceFeedbackEnabled) {
@@ -116,6 +109,36 @@ struct ContentView: View {
             }
         }
         .padding(.bottom, 30)
+    }
+
+    /// 实时字幕：定稿历史（白色实字）+ 未定稿文本（灰色）即时显示。
+    @ViewBuilder
+    private var captionPanel: some View {
+        let hasContent = !viewModel.captionHistory.isEmpty || !viewModel.volatileTranscript.isEmpty
+        if viewModel.isListening || hasContent {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(viewModel.captionHistory) { line in
+                    Text(line.text)
+                        .font(.subheadline)
+                        .foregroundStyle(.white)
+                }
+                if !viewModel.volatileTranscript.isEmpty {
+                    Text(viewModel.volatileTranscript)
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.55))
+                } else if viewModel.captionHistory.isEmpty, viewModel.isListening {
+                    Text("……")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+            .padding(.horizontal, 16)
+            .animation(.easeOut(duration: 0.15), value: viewModel.captionHistory)
+        }
     }
 
     private var micButton: some View {

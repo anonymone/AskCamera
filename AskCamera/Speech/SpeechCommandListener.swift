@@ -2,7 +2,7 @@ import AVFoundation
 import Foundation
 import Speech
 
-/// 语音识别事件：volatile 为实时未定稿文本，final 为定稿文本（触发指令解析）。
+/// 语音识别事件：volatile 为实时未定稿文本，final 为定稿文本。
 enum TranscriptEvent {
     case volatile(String)
     case final(String)
@@ -24,15 +24,33 @@ enum SpeechListenerError: LocalizedError {
 
 /// 基于 iOS 26 SpeechAnalyzer 的端侧流式语音识别。
 /// 音频不出设备；语言模型由系统 AssetInventory 管理（首次使用自动下载）。
+///
+/// 模块选择：优先 DictationTranscriber（短语句/指令场景，定稿更快），
+/// 该语言不支持时回退到 SpeechTranscriber（长文本模块）。
 final class SpeechCommandListener {
+
+    /// 当前使用的转写模块。
+    private enum Module {
+        case dictation(DictationTranscriber)
+        case transcription(SpeechTranscriber)
+
+        var speechModule: any SpeechModule {
+            switch self {
+            case .dictation(let m): return m
+            case .transcription(let m): return m
+            }
+        }
+    }
 
     private let audioEngine = AVAudioEngine()
     private var analyzer: SpeechAnalyzer?
-    private var transcriber: SpeechTranscriber?
+    private var module: Module?
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var resultsTask: Task<Void, Never>?
 
     private(set) var isListening = false
+    /// 当前模块名（供日志/调试）。
+    private(set) var activeModuleName = ""
 
     /// 启动监听，返回识别事件流。
     func start(locale: Locale = Locale(identifier: "zh-CN")) async throws -> AsyncStream<TranscriptEvent> {
@@ -40,17 +58,13 @@ final class SpeechCommandListener {
             throw SpeechListenerError.microphoneDenied
         }
 
-        let transcriber = SpeechTranscriber(locale: locale,
-                                            transcriptionOptions: [],
-                                            reportingOptions: [.volatileResults],
-                                            attributeOptions: [])
-        try await ensureModel(for: transcriber, locale: locale)
+        let module = try await makeModule(locale: locale)
+        self.module = module
 
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        self.transcriber = transcriber
+        let analyzer = SpeechAnalyzer(modules: [module.speechModule])
         self.analyzer = analyzer
 
-        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
+        guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module.speechModule]) else {
             throw SpeechListenerError.localeNotSupported(locale)
         }
 
@@ -65,10 +79,19 @@ final class SpeechCommandListener {
         let (eventStream, eventContinuation) = AsyncStream<TranscriptEvent>.makeStream()
         resultsTask = Task {
             do {
-                for try await result in transcriber.results {
-                    let text = String(result.text.characters)
-                    guard !text.isEmpty else { continue }
-                    eventContinuation.yield(result.isFinal ? .final(text) : .volatile(text))
+                switch module {
+                case .dictation(let transcriber):
+                    for try await result in transcriber.results {
+                        let text = String(result.text.characters)
+                        guard !text.isEmpty else { continue }
+                        eventContinuation.yield(result.isFinal ? .final(text) : .volatile(text))
+                    }
+                case .transcription(let transcriber):
+                    for try await result in transcriber.results {
+                        let text = String(result.text.characters)
+                        guard !text.isEmpty else { continue }
+                        eventContinuation.yield(result.isFinal ? .final(text) : .volatile(text))
+                    }
                 }
             } catch {
                 print("[SpeechCommandListener] 识别流中断: \(error)")
@@ -89,24 +112,49 @@ final class SpeechCommandListener {
         resultsTask?.cancel()
         resultsTask = nil
         analyzer = nil
-        transcriber = nil
+        module = nil
         inputBuilder = nil
     }
 
-    // MARK: - 模型资产
+    // MARK: - 模块创建与资产
 
-    /// 确认目标语言的端侧模型可用，必要时触发系统下载。
-    private func ensureModel(for transcriber: SpeechTranscriber, locale: Locale) async throws {
-        let supported = await SpeechTranscriber.supportedLocales
-        guard supported.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
-            throw SpeechListenerError.localeNotSupported(locale)
+    private func makeModule(locale: Locale) async throws -> Module {
+        // 短指令场景优先 DictationTranscriber：定稿延迟更低
+        let dictationLocales = await DictationTranscriber.supportedLocales
+        if dictationLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
+            let transcriber = DictationTranscriber(locale: locale,
+                                                   contentHints: [.shortForm],
+                                                   transcriptionOptions: [],
+                                                   reportingOptions: [.volatileResults],
+                                                   attributeOptions: [])
+            try await ensureAssets(for: transcriber, locale: locale,
+                                   installed: await Set(DictationTranscriber.installedLocales.map { $0.identifier(.bcp47) }))
+            activeModuleName = "DictationTranscriber"
+            print("[SpeechCommandListener] 使用 DictationTranscriber（短指令模块）")
+            return .dictation(transcriber)
         }
 
-        let installed = await Set(SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        let transcriptionLocales = await SpeechTranscriber.supportedLocales
+        guard transcriptionLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
+            throw SpeechListenerError.localeNotSupported(locale)
+        }
+        let transcriber = SpeechTranscriber(locale: locale,
+                                            transcriptionOptions: [],
+                                            reportingOptions: [.volatileResults],
+                                            attributeOptions: [])
+        try await ensureAssets(for: transcriber, locale: locale,
+                               installed: await Set(SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) }))
+        activeModuleName = "SpeechTranscriber"
+        print("[SpeechCommandListener] 使用 SpeechTranscriber（长文本模块回退）")
+        return .transcription(transcriber)
+    }
+
+    /// 确认端侧模型已安装，必要时触发系统下载。
+    private func ensureAssets(for module: any SpeechModule, locale: Locale, installed: Set<String>) async throws {
         if installed.contains(locale.identifier(.bcp47)) {
             return
         }
-        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) {
             try await request.downloadAndInstall()
         }
     }
@@ -115,7 +163,8 @@ final class SpeechCommandListener {
 
     private func configureAudioSession() throws {
         let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker])
+        // .default 模式保留系统 AGC/降噪处理链（.measurement 会关闭，嘈杂环境准确率下降）
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.duckOthers, .defaultToSpeaker])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
     }
 

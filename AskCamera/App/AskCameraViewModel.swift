@@ -42,8 +42,21 @@ final class AskCameraViewModel: ObservableObject {
         let label: String
     }
 
+    /// 实时字幕：定稿历史（保留最近 3 行）。
+    @Published var captionHistory: [CaptionLine] = []
+
+    struct CaptionLine: Identifiable, Equatable {
+        let id = UUID()
+        let text: String
+    }
+
     private var listeningTask: Task<Void, Never>?
     private var highlightDismissTask: Task<Void, Never>?
+
+    /// volatile 快路径状态：未定稿文本解析出完整指令并稳定 400ms 即执行，final 到达时去重。
+    private var volatileCommandTask: Task<Void, Never>?
+    private var lastExecutedCommand: FocusCommand?
+    private var lastExecutedAt: TimeInterval = 0
 
     /// 跟踪节流状态。
     private var trackedLabel = ""
@@ -93,14 +106,18 @@ final class AskCameraViewModel: ObservableObject {
                 statusText = "正在准备语音模型……"
                 let events = try await speech.start()
                 isListening = true
+                captionHistory = []
                 statusText = "正在聆听，说\u{201C}对焦到……\u{201D}"
                 for await event in events {
                     switch event {
                     case .volatile(let text):
                         volatileTranscript = text
+                        scheduleVolatileCommand(from: text)
                     case .final(let text):
                         volatileTranscript = ""
-                        await handleFinalTranscript(text)
+                        volatileCommandTask?.cancel()
+                        appendCaption(text)
+                        await handleTranscript(text, isFinal: true)
                     }
                 }
             } catch {
@@ -121,12 +138,46 @@ final class AskCameraViewModel: ObservableObject {
 
     // MARK: - 指令处理
 
-    private func handleFinalTranscript(_ text: String) async {
+    /// 定稿字幕历史，保留最近 3 行。
+    private func appendCaption(_ text: String) {
+        captionHistory.append(CaptionLine(text: text))
+        if captionHistory.count > 3 {
+            captionHistory.removeFirst(captionHistory.count - 3)
+        }
+    }
+
+    /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
+    /// 不等定稿（定稿往往滞后 1~2 秒）。文本再变化会重置计时。
+    private func scheduleVolatileCommand(from text: String) {
+        guard FocusIntentParser.parseCommand(text) != nil else { return }
+        volatileCommandTask?.cancel()
+        volatileCommandTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            await self?.handleTranscript(text, isFinal: false)
+        }
+    }
+
+    private func handleTranscript(_ text: String, isFinal: Bool) async {
         guard let command = FocusIntentParser.parseCommand(text) else {
-            statusText = "\u{201C}\(text)\u{201D}（未识别为对焦指令）"
+            if isFinal {
+                statusText = "\u{201C}\(text)\u{201D}（未识别为对焦指令）"
+            }
             return
         }
 
+        // volatile 与 final 去重：相同指令 3 秒内只执行一次
+        let now = CACurrentMediaTime()
+        if command == lastExecutedCommand, now - lastExecutedAt < 3 {
+            return
+        }
+        lastExecutedCommand = command
+        lastExecutedAt = now
+
+        await execute(command)
+    }
+
+    private func execute(_ command: FocusCommand) async {
         let intent: FocusIntent
         switch command {
         case .reset:

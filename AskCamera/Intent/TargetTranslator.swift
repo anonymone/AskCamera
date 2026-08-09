@@ -45,6 +45,25 @@ enum TargetTranslator {
         "山": "mountain", "云": "cloud", "月亮": "moon", "太阳": "sun",
     ]
 
+    /// 拼音 → 英文映射（懒构建）。
+    /// ASR 同音字错误（"苹果"→"平果"）导致词典精确匹配失效，退化到拼音层再查一次。
+    private static let pinyinIndex: [String: String] = {
+        var index: [String: String] = [:]
+        for (chinese, english) in dictionary {
+            // 先到先得：同音碰撞时保留任意一个（词典内碰撞极少且多为同义）
+            index[pinyin(of: chinese)] = english
+        }
+        return index
+    }()
+
+    /// 汉字 → 无声调拼音（系统内置转换，无第三方依赖）。
+    private static func pinyin(of text: String) -> String {
+        let mutable = NSMutableString(string: text)
+        CFStringTransform(mutable, nil, kCFStringTransformMandarinLatin, false)
+        CFStringTransform(mutable, nil, kCFStringTransformStripDiacritics, false)
+        return (mutable as String).replacingOccurrences(of: " ", with: "")
+    }
+
     /// 翻译目标词为 CLIP 可用的英文。全程端侧。
     static func translate(_ target: String) async -> String {
         let trimmed = target.trimmingCharacters(in: .whitespaces)
@@ -54,8 +73,13 @@ enum TargetTranslator {
             return trimmed.lowercased()
         }
 
-        // 词典命中
+        // 词典精确命中
         if let hit = dictionary[trimmed] {
+            return hit
+        }
+
+        // 拼音层命中（容忍同音字误识别，如"平果"→"苹果"→apple）
+        if let hit = pinyinIndex[pinyin(of: trimmed)] {
             return hit
         }
 
