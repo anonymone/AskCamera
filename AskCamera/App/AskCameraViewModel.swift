@@ -149,7 +149,12 @@ final class AskCameraViewModel: ObservableObject {
     /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
     /// 不等定稿（定稿往往滞后 1~2 秒）。文本再变化会重置计时。
     private func scheduleVolatileCommand(from text: String) {
-        guard FocusIntentParser.parseCommand(text) != nil else { return }
+        guard let command = FocusIntentParser.parseCommand(text) else { return }
+        // 无目标的裸"对焦"只在定稿时执行：说到一半的"对焦到……"会被暂时解析成
+        // 无目标指令，快路径执行会误触发显著性对焦
+        if case .focus(let intent) = command, intent.target == nil {
+            return
+        }
         volatileCommandTask?.cancel()
         volatileCommandTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))

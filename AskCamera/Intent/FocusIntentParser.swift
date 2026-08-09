@@ -55,16 +55,53 @@ enum FocusIntentParser {
     }
 
     /// 解析语音指令（对焦 / 取消）。非指令返回 nil。
+    ///
+    /// 连续转写会把前后多句话累积在同一段文本里（"对焦到苹果上对焦到杯子上"），
+    /// 因此先分句、只取最后一条指令解析。
     static func parseCommand(_ rawText: String) -> FocusCommand? {
         let text = normalize(rawText)
-        let lowered = text.lowercased()
+        guard let clause = latestCommandClause(in: text) else { return nil }
+
+        // reset 判断必须在截取触发词之前："取消对焦"包含"对焦"，先截取会误判为对焦指令
+        let lowered = clause.lowercased()
         if resetKeywords.contains(where: { lowered.contains($0) }) {
             return .reset
         }
-        if let intent = parse(text) {
+        if let intent = parse(clause) {
             return .focus(intent)
         }
         return nil
+    }
+
+    /// 提取文本中最后一条指令子句。
+    private static func latestCommandClause(in text: String) -> String? {
+        // 1. 按标点分句，取最后一个含触发词/取消词的分句
+        let separators = CharacterSet(charactersIn: "。，！？；、.,!?;\n")
+        let clauses = text.components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        guard let clause = clauses.last(where: { candidate in
+            let lowered = candidate.lowercased()
+            return triggerKeywords.contains(where: { lowered.contains($0) })
+                || resetKeywords.contains(where: { lowered.contains($0) })
+        }) else { return nil }
+
+        // 取消指令整句保留，不做触发词截取
+        let loweredClause = clause.lowercased()
+        if resetKeywords.contains(where: { loweredClause.contains($0) }) {
+            return clause
+        }
+
+        // 2. 无标点连读（"对焦到苹果上对焦到杯子上"）：从最后一个触发词位置截取
+        var cutIndex = clause.startIndex
+        for keyword in triggerKeywords {
+            if let range = clause.range(of: keyword, options: [.backwards, .caseInsensitive]),
+               range.lowerBound > cutIndex {
+                cutIndex = range.lowerBound
+            }
+        }
+        return String(clause[cutIndex...])
     }
 
     /// 中英文对焦句式。捕获组 1 为目标词。
