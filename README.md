@@ -66,6 +66,45 @@ open AskCamera.xcodeproj
 
 选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。
 
+## CI：PR 自动构建 IPA
+
+每个 Pull Request（打开 / 更新）会触发 GitHub Actions workflow `Build IPA`（`macos-26` + Xcode 26.6），自动：
+
+1. 下载 Core ML 模型
+2. `xcodegen generate`
+3. 编译并上传 `.ipa` 到该次 run 的 Artifacts（保留 14 天）
+
+也可在 Actions 页手动 `workflow_dispatch` 触发。
+
+### 签名配置（导出可安装包）
+
+未配置签名时，CI 仍会产出 `AskCamera-unsigned.ipa`（仅验证编译，**不能**直接装到真机）。
+
+要导出可安装 IPA，在仓库 **Settings → Secrets and variables → Actions** 添加：
+
+| Secret | 说明 |
+|---|---|
+| `BUILD_CERTIFICATE_BASE64` | 导出的 `.p12` 证书，`base64 -i cert.p12 \| pbcopy` |
+| `P12_PASSWORD` | `.p12` 密码 |
+| `BUILD_PROVISION_PROFILE_BASE64` | `.mobileprovision`，同样 base64 |
+| `KEYCHAIN_PASSWORD` | CI 临时钥匙串密码（任意足够长的随机串） |
+| `APPLE_TEAM_ID` | Apple Developer Team ID（10 位） |
+
+可选 Repository variables：
+
+| Variable | 默认 | 说明 |
+|---|---|---|
+| `EXPORT_METHOD` | `development` | `development` / `ad-hoc` / `app-store` |
+| `CODE_SIGN_IDENTITY` | 按 method 自动选择 | 例如 `Apple Development` |
+
+本地可用同一脚本（需 macOS + Xcode）：
+
+```bash
+./scripts/download_models.sh
+xcodegen generate
+./scripts/ci_build_ipa.sh   # 产物在 build/ipa/
+```
+
 ## 使用
 
 - 点击画面任意位置：手动对焦

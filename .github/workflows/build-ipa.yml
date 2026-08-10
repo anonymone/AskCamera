@@ -1,0 +1,73 @@
+name: Build IPA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: build-ipa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ipa:
+    name: Build IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app && xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Download Core ML models
+        run: ./scripts/download_models.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build IPA
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EXPORT_METHOD: ${{ vars.EXPORT_METHOD }}
+          CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY }}
+        run: ./scripts/ci_build_ipa.sh
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: AskCamera-PR${{ github.event.pull_request.number || 'manual' }}-${{ github.sha }}
+          path: build/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## AskCamera IPA"
+            echo ""
+            if [[ -d build/ipa ]]; then
+              echo "产物已上传为 workflow artifact："
+              echo ""
+              echo '```'
+              ls -lh build/ipa
+              echo '```'
+              if ls build/ipa/*-unsigned.ipa >/dev/null 2>&1; then
+                echo ""
+                echo "> 当前未配置签名 Secrets，产物为未签名 IPA，不能直接安装到真机。"
+                echo "> 请按 README「CI：PR 自动构建 IPA」章节配置仓库 Secrets。"
+              fi
+            else
+              echo "构建未产出 IPA，请查看上方日志。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
