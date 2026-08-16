@@ -1,13 +1,12 @@
 import Foundation
 import Speech
 
-/// 用命令模板训练的自定义语言模型，偏置 DictationTranscriber 输出「对焦到苹果」而不是同音错字。
-///
-/// 编译需要数秒，不能挡住首次听写：已有缓存则立刻用，否则后台准备、下次会话再生效。
+/// 只训练命令句式，不把物体名写进语言模型。
+/// 编译需要数秒：已有缓存立刻用，否则后台准备、下次会话再生效。
 enum SpeechCommandLanguageModel {
 
     static let identifier = "com.severuspeng.AskCamera.commands"
-    static let version = "1"
+    static let version = "2"
 
     private static let cacheLock = NSLock()
     private static var cachedConfiguration: SFSpeechLanguageModel.Configuration?
@@ -50,42 +49,29 @@ enum SpeechCommandLanguageModel {
     }
 
     private static func makeTrainingData(locale: Locale) -> SFCustomLanguageModelData {
-        let objects = TargetTranslator.chineseVocabulary
-        let colors = TargetTranslator.chineseColorWords
-        return SFCustomLanguageModelData(
-            locale: locale,
-            identifier: identifier,
-            version: version
-        ) {
-            SFCustomLanguageModelData.PhraseCount(phrase: "对焦", count: 400)
-            SFCustomLanguageModelData.PhraseCount(phrase: "对焦到", count: 400)
-            SFCustomLanguageModelData.PhraseCount(phrase: "对准", count: 200)
-            SFCustomLanguageModelData.PhraseCount(phrase: "聚焦", count: 200)
-            SFCustomLanguageModelData.PhraseCount(phrase: "拍照", count: 400)
-            SFCustomLanguageModelData.PhraseCount(phrase: "拍一张", count: 200)
-            SFCustomLanguageModelData.PhraseCount(phrase: "照相", count: 150)
-            SFCustomLanguageModelData.PhraseCount(phrase: "录像", count: 400)
-            SFCustomLanguageModelData.PhraseCount(phrase: "开始录像", count: 250)
-            SFCustomLanguageModelData.PhraseCount(phrase: "停止录像", count: 250)
-            SFCustomLanguageModelData.PhraseCount(phrase: "取消对焦", count: 150)
-            SFCustomLanguageModelData.PhraseCount(phrase: "取消倒计时", count: 100)
-            SFCustomLanguageModelData.PhraseCount(phrase: "取消", count: 100)
-
-            SFCustomLanguageModelData.PhraseCountsFromTemplates(classes: [
-                "object": objects,
-                "color": colors,
-                "spatial": ["左边的", "右边的", "上面的", "下面的", "左侧的", "右侧的"],
-                "seconds": ["3", "5", "10", "15"],
-            ]) {
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("对焦到<object>", count: 80)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("对焦到<spatial><object>", count: 40)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("对焦到<color>的<object>", count: 40)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("对准<object>", count: 30)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("<seconds>秒后拍照", count: 60)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("录<seconds>秒", count: 60)
-                SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("<seconds>秒后开始录像", count: 40)
-            }
+        let data = SFCustomLanguageModelData(locale: locale, identifier: identifier, version: version)
+        let weightedPhrases: [(String, Int)] = [
+            ("对焦", 400), ("对焦到", 500), ("对准", 200), ("聚焦", 200),
+            ("拍照", 400), ("拍一张", 200), ("照相", 150),
+            ("录像", 400), ("开始录像", 250), ("停止录像", 250),
+            ("取消对焦", 150), ("取消倒计时", 100), ("取消", 100),
+            ("对焦到左边的", 80), ("对焦到右边的", 80),
+        ]
+        for (phrase, count) in weightedPhrases {
+            data.insert(phraseCount: SFCustomLanguageModelData.PhraseCount(phrase: phrase, count: count))
         }
+
+        let templates = SFCustomLanguageModelData.PhraseCountsFromTemplates(classes: [
+            "seconds": ["3", "5", "10", "15"],
+            "spatial": ["左边的", "右边的", "上面的", "下面的"],
+        ]) {
+            SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("<seconds>秒后拍照", count: 80)
+            SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("录<seconds>秒", count: 80)
+            SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("<seconds>秒后开始录像", count: 50)
+            SFCustomLanguageModelData.TemplatePhraseCountGenerator.Template("对焦到<spatial>", count: 40)
+        }
+        templates.insert(data: data)
+        return data
     }
 
     private static func cacheURLs() -> (directory: URL, training: URL, model: URL) {

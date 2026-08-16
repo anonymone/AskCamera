@@ -268,7 +268,11 @@ final class AskCameraViewModel: ObservableObject {
     private func scheduleVolatileCommand(sourceText: String, alternatives: [String] = []) {
         volatileCommandTask?.cancel()
         let candidates = transcriptCandidates(best: sourceText, alternatives: alternatives)
-        guard let chosen = candidates.first(where: { canScheduleVolatile(leftoverTranscript(from: $0)) }) else {
+        guard let chosen = CommandCandidateRanker.pick(
+            best: candidates.first ?? sourceText,
+            alternatives: Array(candidates.dropFirst()),
+            leftover: leftoverTranscript
+        ), canScheduleVolatile(leftoverTranscript(from: chosen)) else {
             return
         }
         let chosenLeftover = leftoverTranscript(from: chosen)
@@ -286,18 +290,7 @@ final class AskCameraViewModel: ObservableObject {
     }
 
     private func canScheduleVolatile(_ leftover: String) -> Bool {
-        if CaptureCommandParser.parse(leftover) != nil { return true }
-        guard let command = FocusIntentParser.parseCommand(leftover) else { return false }
-        if case .focus(let intent) = command, intent.target == nil {
-            return false
-        }
-        if case .focus(let intent) = command, let target = intent.target {
-            if TargetTranslator.isAttributedPhrase(target) { return true }
-            if TargetTranslator.lookup(target) != nil { return true }
-            if target.allSatisfy(\.isASCII) { return true }
-            return false
-        }
-        return true
+        CommandCandidateRanker.score(leftover) >= 70
     }
 
     private func transcriptCandidates(best: String, alternatives: [String]) -> [String] {
@@ -314,9 +307,13 @@ final class AskCameraViewModel: ObservableObject {
 
     private func handleTranscriptCandidates(best: String, alternatives: [String], isFinal: Bool) async {
         let candidates = transcriptCandidates(best: best, alternatives: alternatives)
-        for text in candidates {
-            let leftover = leftoverTranscript(from: text)
-            if await handleTranscript(leftover, sourceText: text, isFinal: isFinal) {
+        if let chosen = CommandCandidateRanker.pick(
+            best: candidates.first ?? best,
+            alternatives: Array(candidates.dropFirst()),
+            leftover: leftoverTranscript
+        ) {
+            let leftover = leftoverTranscript(from: chosen)
+            if await handleTranscript(leftover, sourceText: chosen, isFinal: isFinal) {
                 return
             }
         }
@@ -352,6 +349,12 @@ final class AskCameraViewModel: ObservableObject {
             return false
         }
         if query.action == .none { return false }
+        if query.objectUnresolved {
+            if isFinal {
+                statusText = "还不能把\u{201C}\(query.displayName)\u{201D}当成检测目标"
+            }
+            return isFinal
+        }
 
         // 去重看检测意图，不看 displayName（连读改写会让文案变长但 prompts 相同）
         if query.action == lastExecutedQuery?.action,
@@ -510,6 +513,11 @@ final class AskCameraViewModel: ObservableObject {
             return
         case .focus:
             break
+        }
+
+        if query.objectUnresolved {
+            statusText = "还不能把\u{201C}\(query.displayName)\u{201D}当成检测目标"
+            return
         }
 
         let displayName = query.displayName.isEmpty ? "显著物体" : query.displayName

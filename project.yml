@@ -22,6 +22,8 @@ targets:
       - path: Models/clip_vocab.json
         optional: true
         buildPhase: resources
+      - path: Models/zh_en_nouns.json
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.severuspeng.AskCamera

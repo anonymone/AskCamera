@@ -61,6 +61,59 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertNil(FocusIntentParser.parseCommand("对焦到白色的"))
     }
 
+    func testBareNounIsNotACommand() {
+        XCTAssertNil(FocusIntentParser.parseCommand("鼠标"))
+        XCTAssertNil(CaptureCommandParser.parse("鼠标"))
+        XCTAssertEqual(CommandCandidateRanker.score("鼠标"), 0)
+    }
+
+    func testOpenVocabularyNounsFromLexicon() async {
+        XCTAssertEqual(TargetTranslator.lookup("订书机"), "stapler")
+        XCTAssertEqual(TargetTranslator.lookup("八音盒"), "music box")
+        XCTAssertEqual(TargetTranslator.lookup("牌照"), "license plate")
+
+        let query = await QueryUnderstanding.resolve("对焦到订书机", allowLanguageModel: false)
+        XCTAssertEqual(query?.yoloPrompts, ["stapler"])
+        XCTAssertEqual(query?.objectUnresolved, false)
+        XCTAssertEqual(query?.useSaliency, false)
+    }
+
+    func testUnknownObjectDoesNotPassChineseToYOLO() async {
+        let query = await QueryUnderstanding.resolve("对焦到量子闪闪球", allowLanguageModel: false)
+        XCTAssertEqual(query?.objectUnresolved, true)
+        XCTAssertTrue(query?.yoloPrompts.isEmpty ?? false)
+        XCTAssertEqual(query?.useSaliency, false)
+    }
+
+    func testASRBiasIsCommandOnly() {
+        let phrases = SpeechVocabulary.contextualPhrases()
+        XCTAssertTrue(phrases.contains("对焦到"))
+        XCTAssertTrue(phrases.contains("拍照"))
+        XCTAssertFalse(phrases.contains("苹果"))
+        XCTAssertFalse(phrases.contains("鼠标"))
+        XCTAssertFalse(phrases.contains("订书机"))
+    }
+
+    func testNBestKeepsPrimaryFocusOverSpuriousPhoto() {
+        let picked = CommandCandidateRanker.pick(
+            best: "对焦到鼠标",
+            alternatives: ["拍照", "开始录像"],
+            leftover: { $0 }
+        )
+        XCTAssertEqual(picked, "对焦到鼠标")
+        XCTAssertGreaterThan(CommandCandidateRanker.score("对焦到鼠标"), 0)
+        XCTAssertEqual(CommandCandidateRanker.score("拍照"), 100)
+    }
+
+    func testNBestFallsBackWhenPrimaryIsNotACommand() {
+        let picked = CommandCandidateRanker.pick(
+            best: "嗯",
+            alternatives: ["对角到平果"],
+            leftover: { $0 }
+        )
+        XCTAssertEqual(picked, "对角到平果")
+    }
+
     func testQueryUnderstandingRecoversTyposWithoutLanguageModel() async {
         let query = await QueryUnderstanding.resolve("对角到平果", allowLanguageModel: false)
         XCTAssertEqual(query?.action, .focus)

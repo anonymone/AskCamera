@@ -9,22 +9,21 @@
 感知 → 决策 → 执行 闭环：
 
 ```
-麦克风 ──► SpeechAnalyzer + 领域偏置
+麦克风 ──► SpeechAnalyzer（只偏置命令框）
               │ DictationTranscriber（短指令优先；否则 SpeechTranscriber）
-              │ contextualStrings + 自定义命令 LM + n-best 候选
-              │ volatile 部分结果 + final 定稿
+              │ contextualStrings / 自定义 LM：对焦·拍照·录像，不含物体名
+              │ n-best：主结果能执行则用主结果
               ▼
-         TranscriptNormalizer（同音/拼音改写 + 中文数字）
+         TranscriptNormalizer（只改触发词同音 + 中文数字）
               ▼
-         leftover 切句（只解析尚未执行的新句子；最后一条指令优先）
+         leftover 切句 → 槽位解析
+              │  命令封闭：无对焦/拍照/录像则丢弃（光杆「鼠标」不执行）
               │
-              ├─► CaptureCommandParser（拍照 / 录像 / 倒计时，规则快路径）
+              ├─► CaptureCommandParser（拍照 / 录像 / 倒计时）
               └─► QueryUnderstanding（对焦）
-                    │ 规则快筛（触发词 / 取消 / 半句丢弃）
-                    │ 简单名词：词典/拼音/模糊匹配 → DetectionQuery
-                    │ 颜色等修饰：Foundation Models @Generable
-                    │   不可用时 → 规则 attributed-fallback（如 white mouse + mouse）
-                    │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
+                    │ 物体开放：整词词典 / 离线名词表 / 拼音
+                    │ 再未命中：Foundation Models（可选）
+                    │ 仍无英文：unresolved，不把中文丢给 CLIP
                     ▼
 相机帧 ──► YOLO-World V2（Core ML，多英文 prompt 槽位）
               │ 未随包分发模型时降级为 Vision 显著性检测
@@ -47,23 +46,27 @@
 | 对焦到鼠标 | `dictionary` | prompts `["mouse"]` |
 | 对焦到左边的鼠标 | `dictionary` | `mouse` + `spatial=left` |
 | 对焦到白色的鼠标 | `foundation-models` 或 `attributed-fallback` | `["white mouse", "mouse"]` |
+| 对焦到订书机 | `lexicon` | prompts `["stapler"]` |
 | 对焦 | 显著性 | Vision 显著物体 |
+| 鼠标 | 忽略 | 光杆名词不是指令 |
 | 取消对焦 | `reset` | 停止跟踪，回到画面中心 |
 
 连读或 ASR 把前后句拼在同一段里时：采集指令与对焦指令都只看尚未消费的新句子；目标短语只保留最后一个「(颜色的)?物体」，避免「白色的鼠标…键盘」把颜色套到后一个词上。半句（「对焦到」「白色的」）不会当成裸「对焦」去打显著性。
 
 ### 语音识别容错
 
-短指令缺上下文，端侧听写容易把「对焦 / 拍照 / 苹果」写成同音错字，规则解析一旦对不上就整句失败。本应用保持**全部端侧、无网络**，用两层兜底而不是换云端 ASR：
+命令槽封闭、物体槽开放。短指令缺上下文，端侧听写容易把「对焦 / 拍照」写成同音错字；物体名则应保持用户说的那个词，不能吸成词典里的常见物。
 
 | 层 | 做法 | 解决什么 |
 |---|---|---|
-| 识别偏置 | `AnalysisContext.contextualStrings`（命令 + 常见物体，最多 100 条）；后台编译 `SFCustomLanguageModelData` 命令模板，下次听写经 `customizedLanguage` 生效 | 从源头减少「对角 / 平果」 |
-| n-best | `alternativeTranscriptions`，最优转写解析失败时按序再试候选 | 同音句系统其实认出了正确词，只是没排第一 |
-| 文本归一化 | `TranscriptNormalizer`：近音表 + 拼音滑动窗口改写触发词；「五秒后拍照」→ `5秒后拍照` | 「对角到…」「怕照」「十五秒后录像」 |
-| 词典容错 | 物体名拼音精确匹配；三字及以上拼音编辑距离 1；颜色/名词同音窗口（「白色的平果」→ apple） | 目标词错字不再让 YOLO prompt 对空 |
+| 识别偏置 | `contextualStrings` 与自定义 LM **只含命令句式**（对焦/拍照/录像/方位），不含苹果、鼠标 | 听清这是一句指令，不把「订书机」听成常见物 |
+| n-best | 主结果能执行就用主结果；只有主结果不是指令时才改用候选 | 「对焦到鼠标」不会被次优「拍照」抢走 |
+| 文本归一化 | 拼音/近音只改触发词；「五秒后拍照」→ `5秒后拍照`；介词后的同音词当物体 | 「对角到…」「怕照」；「对焦到牌照」仍是牌照 |
+| 物体解析 | 整词词典 → 离线中英名词表（`Models/zh_en_nouns.json`）→ 拼音整词 → 端模型；禁止句内同音滑动替换 | 「平果」→ 苹果；「订书机」→ stapler；中文绝不进 CLIP |
 
-不采用的方案：云端 Whisper / 大模型纠错（违反端侧约束）；把听写引擎换成 `SpeechTranscriber` 长文本模块（短指令更慢，且不吃 contextualStrings）。
+光杆「鼠标」不是指令。必须说「对焦到鼠标」。没有英文 prompt 时提示无法检测，不会误对焦到显著物体。
+
+不采用：云端 Whisper；`SpeechTranscriber` 长文本模块；继续加同音错字表。
 
 ### 开放词汇检测
 
@@ -80,8 +83,8 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 |---|---|
 | `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput）、倒计时手电筒 |
 | `AskCamera/Capture` | 拍照/录像语音指令、倒计时调度、滴声提示（`CountdownBeeper`） |
-| `AskCamera/Speech` | iOS 26 `SpeechAnalyzer`：优先 `DictationTranscriber`，词汇偏置 + n-best，回退 `SpeechTranscriber` |
-| `AskCamera/Intent` | 转写归一化 + 规则快筛 + 词典/拼音/模糊匹配 + Foundation Models `@Generable` + 颜色短语回退 |
+| `AskCamera/Speech` | iOS 26 `SpeechAnalyzer`：命令框偏置 + n-best；优先 `DictationTranscriber` |
+| `AskCamera/Intent` | 命令封闭 / 物体开放：触发词归一化、离线名词表、Foundation Models、无法翻译则 unresolved |
 | `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底、焦点跟踪 |
 | `AskCamera/App` | SwiftUI 界面与流水线协调（`AskCameraViewModel`） |
 
@@ -92,7 +95,7 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 - [x] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标（节流对焦、跟丢自动复位）
 - [x] 阶段四：Foundation Models 查询理解（结构化 `DetectionQuery` → YOLO prompts；简单路径仍走词典；端模型不可用时规则回退）
 - [x] 拍照 / 录像 / 语音倒计时（滴声 + 可选闪光，采集指令优先于对焦）
-- [x] 语音识别容错（领域偏置 + 拼音/同音纠错 + n-best，错字仍可执行）
+- [x] 语音识别容错：命令封闭、物体开放（命令偏置 + 离线名词表 + 整词拼音）
 - [ ] 阶段五：FastVLM 指代消歧、LiDAR 深度辅助
 
 ## 构建

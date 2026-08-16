@@ -5,11 +5,11 @@ import FoundationModels
 
 /// 查询理解：用户话语 → `DetectionQuery`（YOLO prompts + 选择条件）。
 ///
-/// 路由：
-/// 1. 规则快筛（分句 / 触发词 / 取消）
-/// 2. 词典命中的简单目标 → 跳过端模型
-/// 3. 复杂指代或词典未命中 → Foundation Models `@Generable`（可选）
-/// 4. 端模型不可用 → 规则 + 词典/拼音/字符串翻译回退
+/// 命令槽封闭、物体槽开放：
+/// 1. 规则快筛（必须有对焦/取消触发词；光杆「鼠标」不是指令）
+/// 2. 整词词典 / 离线名词表 / 拼音 → 跳过端模型
+/// 3. 复杂指代或仍未命中 → Foundation Models（可选）
+/// 4. 仍无英文 prompt → unresolved，不把中文丢给 CLIP
 enum QueryUnderstanding {
 
     /// - Parameter allowLanguageModel: volatile 快路径应传 false，避免端模型延迟与半句误触发。
@@ -66,13 +66,16 @@ enum QueryUnderstanding {
                           spatialHint: intent.spatialHint)
         }
 
-        // 回退：异步翻译（可能仍走端模型字符串翻译）+ 规则方位
-        let english = await TargetTranslator.translate(rawTarget)
-        let reason = allowLanguageModel ? "FM未命中/不可用" : "volatile禁用端模型"
-        log("translate-fallback", detail: "\(reason) \(rawTarget) → \(english)")
-        return .focus(prompts: [english],
-                      displayName: rawTarget,
-                      spatialHint: intent.spatialHint)
+        if let english = await TargetTranslator.translate(rawTarget, allowLanguageModel: allowLanguageModel) {
+            let reason = allowLanguageModel ? "词表未命中" : "volatile禁用端模型"
+            log("translate-fallback", detail: "\(reason) \(rawTarget) → \(english)")
+            return .focus(prompts: [english],
+                          displayName: rawTarget,
+                          spatialHint: intent.spatialHint)
+        }
+
+        log("unresolved", detail: rawTarget)
+        return .unresolved(displayName: rawTarget, spatialHint: intent.spatialHint)
     }
 
     private static func log(_ route: String, detail: String) {
@@ -136,6 +139,7 @@ private enum FoundationQueryModel {
             The vision model is YOLO-World: it needs short English noun phrases, not captions.
             Rules:
             - yoloPrompts: 1-4 concise English noun phrases (category-like). Include useful synonyms or color/size if present (e.g. "blue book", "mug").
+            - Never replace a specific object with a more common one (stapler stays stapler, not mouse).
             - Never put left/right/top/bottom/上/下/左/右 into yoloPrompts; put that into spatial instead.
             - displayName: brief Chinese for speaking back to the user.
             - action is almost always "focus" for a target phrase. Use "none" only if the text is not an object focus request.
@@ -192,9 +196,9 @@ private enum FoundationQueryModel {
 
         let prompts = value.yoloPrompts
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty && $0.allSatisfy(\.isASCII) }
         guard !prompts.isEmpty else {
-            return .saliency(displayName: value.displayName.isEmpty ? fallbackDisplay : value.displayName)
+            return nil
         }
 
         let spatial = parseSpatial(value.spatial) ?? fallbackSpatial

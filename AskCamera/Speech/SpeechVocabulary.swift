@@ -1,8 +1,8 @@
 import Foundation
 import Speech
 
-/// 端侧听写的领域词表：命令短句 + 常见物体。
-/// `AnalysisContext.contextualStrings` 大约 100 条上限，优先命令词再补物体名。
+/// 端侧听写只偏置**命令框**（对焦/拍照/录像/方位），不塞物体名。
+/// 物体槽保持开放，避免「订书机」被听成词典里的常见词。
 enum SpeechVocabulary {
 
     static let commandPhrases: [String] = [
@@ -12,10 +12,10 @@ enum SpeechVocabulary {
         "录像", "开始录像", "停止录像", "停止录制", "录制视频",
         "取消倒计时", "取消拍照", "取消",
         "左边的", "右边的", "上面的", "下面的",
+        "左侧的", "右侧的",
         "focus on", "take a photo", "start recording", "stop recording",
     ]
 
-    /// 传给 DictationTranscriber 的上下文短语（去重、截断到 100）。
     static func contextualPhrases() -> [String] {
         var seen = Set<String>()
         var phrases: [String] = []
@@ -26,8 +26,7 @@ enum SpeechVocabulary {
         }
         append(commandPhrases)
         append(TargetTranslator.chineseColorWords)
-        append(TargetTranslator.chineseVocabulary.sorted { $0.count > $1.count })
-        return Array(phrases.prefix(100))
+        return phrases
     }
 
     static func analysisContext() -> AnalysisContext {
