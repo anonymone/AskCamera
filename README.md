@@ -11,13 +11,13 @@
 ```
 麦克风 ──► SpeechAnalyzer (iOS 26 端侧流式 ASR)
               │ 定稿文本
-              ▼
-        QueryUnderstanding
-              │ 规则快筛（分句 / 触发词 / 取消）
-              │ 简单目标：词典/拼音 → DetectionQuery
-              │ 复杂指代：Foundation Models @Generable → DetectionQuery
-              │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
-              ▼
+              ├─► CaptureCommandParser（拍照 / 录像 / 倒计时，规则快路径）
+              └─► QueryUnderstanding（对焦）
+                    │ 规则快筛（分句 / 触发词 / 取消）
+                    │ 简单目标：词典/拼音 → DetectionQuery
+                    │ 复杂指代：Foundation Models @Generable → DetectionQuery
+                    │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
+                    ▼
 相机帧 ──► YOLO-World V2 (Core ML，多英文 prompt 槽位)
               │ 候选框列表（未随包分发模型时降级为 Vision 显著性检测）
               ▼
@@ -39,7 +39,8 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 
 | 目录 | 职责 |
 |---|---|
-| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、点击对焦、`focusPointOfInterest` 控制 |
+| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput） |
+| `AskCamera/Capture` | 拍照/录像语音指令解析、倒计时与定时停止调度 |
 | `AskCamera/Speech` | 基于 iOS 26 `SpeechAnalyzer`/`SpeechTranscriber` 的端侧流式语音识别 |
 | `AskCamera/Intent` | 查询理解（规则快筛 + 词典 + Foundation Models 结构化 `DetectionQuery`） |
 | `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底 |
@@ -66,12 +67,56 @@ open AskCamera.xcodeproj
 
 选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。
 
+## CI：PR 自动构建 IPA
+
+每个 Pull Request（打开 / 更新）会触发 GitHub Actions workflow `Build IPA`（`macos-26` + Xcode 26.6），自动：
+
+1. 下载 Core ML 模型
+2. `xcodegen generate`
+3. 编译并上传 `.ipa` 到该次 run 的 Artifacts（保留 14 天）
+
+也可在 Actions 页手动 `workflow_dispatch` 触发。
+
+### 签名配置（导出可安装包）
+
+未配置签名时，CI 仍会产出 `AskCamera-unsigned.ipa`（仅验证编译，**不能**直接装到真机）。
+
+要导出可安装 IPA，在仓库 **Settings → Secrets and variables → Actions** 添加：
+
+| Secret | 说明 |
+|---|---|
+| `BUILD_CERTIFICATE_BASE64` | 导出的 `.p12` 证书，`base64 -i cert.p12 \| pbcopy` |
+| `P12_PASSWORD` | `.p12` 密码 |
+| `BUILD_PROVISION_PROFILE_BASE64` | `.mobileprovision`，同样 base64 |
+| `KEYCHAIN_PASSWORD` | CI 临时钥匙串密码（任意足够长的随机串） |
+| `APPLE_TEAM_ID` | Apple Developer Team ID（10 位） |
+
+可选 Repository variables：
+
+| Variable | 默认 | 说明 |
+|---|---|---|
+| `EXPORT_METHOD` | `development` | `development` / `ad-hoc` / `app-store` |
+| `CODE_SIGN_IDENTITY` | 按 method 自动选择 | 例如 `Apple Development` |
+
+本地可用同一脚本（需 macOS + Xcode）：
+
+```bash
+./scripts/download_models.sh
+xcodegen generate
+./scripts/ci_build_ipa.sh   # 产物在 build/ipa/
+```
+
 ## 使用
 
 - 点击画面任意位置：手动对焦
+- 底部快门拍照；红色按钮开始/停止录像（未指定时长时默认录 15 秒）
 - 点击麦克风按钮后说：
-  - "对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
+  - 对焦："对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
+  - 拍照："拍照" / "5 秒后拍照"
+  - 录像："开始录像" / "3 秒后开始录 15 秒视频" / "停止录像"
+  - 取消倒计时："取消" / "取消倒计时"（不停止已在进行的录像）
   - 同类多个物体时支持方位修饰："左边的" / "右边的" / "上面的" / "下面的"
   - 只说"对焦"（无目标词）会对焦到画面中最显著的物体
 - 对焦成功后焦点自动跟随目标移动；说"取消对焦"/"停止跟踪"或点击画面可打断
-- 扬声器开关：开启后对焦成功有语音播报（`AVSpeechSynthesizer`，端侧）
+- 录像开始时会暂停语音识别（麦克风留给影片音轨），结束后若此前在听写则自动恢复
+- 扬声器开关：开启后对焦/拍摄成功有语音播报（`AVSpeechSynthesizer`，端侧）

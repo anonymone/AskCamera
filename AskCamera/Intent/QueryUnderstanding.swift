@@ -14,7 +14,8 @@ enum QueryUnderstanding {
 
     /// - Parameter allowLanguageModel: volatile 快路径应传 false，避免端模型延迟与半句误触发。
     static func resolve(_ rawText: String, allowLanguageModel: Bool = true) async -> DetectionQuery? {
-        // 规则快筛：无对焦/取消触发则直接忽略（降低误触发与端模型调用）
+        // 规则快筛：无对焦/取消触发则直接忽略（降低误触发与端模型调用）。
+        // 拍照/录像由 CaptureCommandParser 在 ViewModel 里先截走，不会进到这里。
         guard let command = FocusIntentParser.parseCommand(rawText) else {
             return nil
         }

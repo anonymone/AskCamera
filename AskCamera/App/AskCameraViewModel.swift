@@ -3,26 +3,35 @@ import Combine
 import SwiftUI
 
 /// 感知-决策-执行流水线的协调者：
-/// 语音(SpeechAnalyzer) → 查询理解(QueryUnderstanding → DetectionQuery)
-/// → 检测(YOLO-World / 显著性兜底) → 对焦(CameraManager)。
+/// 语音(SpeechAnalyzer) → 采集指令(CaptureCommand) / 查询理解(QueryUnderstanding → DetectionQuery)
+/// → 检测(YOLO-World / 显著性兜底) → 对焦 / 拍照 / 录像(CameraManager)。
 @MainActor
 final class AskCameraViewModel: ObservableObject {
 
     let camera = CameraManager()
+    let captureScheduler = CaptureScheduler()
     private let speech = SpeechCommandListener()
     private let salientDetector = SalientObjectDetector()
     private var yoloDetector: YOLOWorldDetector?
     private let tracker = FocusTracker()
     private let feedbackSynthesizer = AVSpeechSynthesizer()
+    private let countdownBeeper = CountdownBeeper()
+    private var cancellables = Set<AnyCancellable>()
 
     // MARK: - UI 状态
 
     @Published var volatileTranscript = ""
-    @Published var statusText = "点击画面对焦，或开启麦克风说\u{201C}对焦到……\u{201D}"
+    @Published var statusText = "点击画面对焦，或说\u{201C}对焦到……\u{201D}/\u{201C}拍照\u{201D}/\u{201C}录像\u{201D}"
     @Published var isListening = false
     @Published var focusHighlight: FocusHighlight?
     @Published var voiceFeedbackEnabled = false
+    /// 倒计时用后置手电筒 + 屏幕闪白，模拟相机自拍灯。
+    @Published var countdownTorchEnabled = false
+    /// 倒计时滴声同步的屏幕闪白。
+    @Published private(set) var countdownFlashOn = false
     @Published private(set) var openVocabularyReady = false
+    /// 倒计时 / 录像结束后是否恢复听写。
+    private var resumeListeningAfterIdle = false
 
     /// 调试模式：显示所有候选框、分数与各环节耗时。
     @Published var debugMode = false
@@ -60,7 +69,9 @@ final class AskCameraViewModel: ObservableObject {
     /// volatile 快路径状态：未定稿文本解析出完整指令并稳定 400ms 即执行，final 到达时去重。
     private var volatileCommandTask: Task<Void, Never>?
     private var lastExecutedQuery: DetectionQuery?
+    private var lastExecutedCaptureCommand: CaptureCommand?
     private var lastExecutedAt: TimeInterval = 0
+    private var countdownCueTask: Task<Void, Never>?
 
     /// 跟踪节流状态。
     private var trackedLabel = ""
@@ -74,6 +85,16 @@ final class AskCameraViewModel: ObservableObject {
 
     func onAppear() {
         Task { await camera.start() }
+        // 嵌套 ObservableObject：转发 scheduler 变更以刷新倒计时 UI
+        captureScheduler.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        camera.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
         // 相机输出队列上逐帧驱动跟踪器
         camera.frameHandler = { [weak self] pixelBuffer in
             guard let self, let update = self.tracker.process(pixelBuffer) else { return }
@@ -97,6 +118,29 @@ final class AskCameraViewModel: ObservableObject {
         QueryUnderstanding.warmUp()
     }
 
+    // MARK: - 手动拍照 / 录像
+
+    func shutterTapped() {
+        Task { await executeCapture(.photo(delaySeconds: 0)) }
+    }
+
+    func recordTapped() {
+        Task {
+            if camera.isRecording {
+                await executeCapture(.stopVideo)
+            } else {
+                await executeCapture(.startVideo(
+                    delaySeconds: 0,
+                    durationSeconds: CaptureCommand.defaultVideoDurationSeconds
+                ))
+            }
+        }
+    }
+
+    func cancelCountdownTapped() {
+        Task { await executeCapture(.cancelPending) }
+    }
+
     // MARK: - 语音控制
 
     func toggleListening() {
@@ -117,12 +161,13 @@ final class AskCameraViewModel: ObservableObject {
                 consumedTranscript = ""
                 captionHistory = []
                 volatileTranscript = ""
-                statusText = "正在聆听，说\u{201C}对焦到……\u{201D}"
+                statusText = "正在聆听：对焦 / 拍照 / 录像"
                 for await event in events {
                     switch event {
                     case .volatile(let text):
-                        volatileTranscript = leftoverTranscript(from: text)
-                        scheduleVolatileCommand(from: text)
+                        let leftover = leftoverTranscript(from: text)
+                        volatileTranscript = leftover
+                        scheduleVolatileCommand(from: leftover, sourceText: text)
                     case .final(let text):
                         volatileTranscript = ""
                         volatileCommandTask?.cancel()
@@ -130,7 +175,7 @@ final class AskCameraViewModel: ObservableObject {
                         if !leftover.isEmpty {
                             appendCaption(leftover)
                         }
-                        await handleTranscript(text, isFinal: true)
+                        await handleTranscript(leftover, sourceText: text, isFinal: true)
                     }
                 }
             } catch {
@@ -194,8 +239,22 @@ final class AskCameraViewModel: ObservableObject {
     /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
     /// 不等定稿（定稿往往滞后 1~2 秒）。文本再变化会重置计时。
     /// 仅走规则+词典，不调用端模型（半句/延迟敏感）。
-    private func scheduleVolatileCommand(from text: String) {
-        guard let command = FocusIntentParser.parseCommand(text) else { return }
+    /// - Parameters:
+    ///   - leftover: 去掉已执行指令后的新句子，用于解析。
+    ///   - sourceText: SpeechAnalyzer 的完整累积原文，执行成功后记入 consumedTranscript。
+    private func scheduleVolatileCommand(from leftover: String, sourceText: String) {
+        guard !leftover.isEmpty else { return }
+        if CaptureCommandParser.parse(leftover) != nil {
+            volatileCommandTask?.cancel()
+            volatileCommandTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard !Task.isCancelled else { return }
+                await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: false)
+            }
+            return
+        }
+
+        guard let command = FocusIntentParser.parseCommand(leftover) else { return }
         // 无目标的裸"对焦"只在定稿时执行：说到一半的"对焦到……"会被暂时解析成
         // 无目标指令，快路径执行会误触发显著性对焦
         if case .focus(let intent) = command, intent.target == nil {
@@ -211,22 +270,36 @@ final class AskCameraViewModel: ObservableObject {
         volatileCommandTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            await self?.handleTranscript(text, isFinal: false)
+            await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: false)
         }
     }
 
-    private func handleTranscript(_ text: String, isFinal: Bool) async {
+    private func handleTranscript(_ leftover: String, sourceText: String, isFinal: Bool) async {
+        guard !leftover.isEmpty else { return }
+        let now = CACurrentMediaTime()
+
+        // 采集指令优先于对焦；只解析尚未消费的新句子，避免累积转写里的旧「拍照」反复命中
+        if let capture = CaptureCommandParser.parse(leftover) {
+            if capture == lastExecutedCaptureCommand, now - lastExecutedAt < 3 {
+                return
+            }
+            lastExecutedCaptureCommand = capture
+            lastExecutedAt = now
+            await executeCapture(capture)
+            consumeTranscript(sourceText)
+            return
+        }
+
         // volatile：禁用端模型；final：允许 Foundation Models 结构化理解
-        guard let query = await QueryUnderstanding.resolve(text, allowLanguageModel: isFinal) else {
+        guard let query = await QueryUnderstanding.resolve(leftover, allowLanguageModel: isFinal) else {
             if isFinal {
-                statusText = "\u{201C}\(text)\u{201D}（未识别为对焦指令）"
+                statusText = "\u{201C}\(leftover)\u{201D}（未识别为指令）"
             }
             return
         }
         if query.action == .none { return }
 
         // volatile 与 final 去重：相同查询 3 秒内只执行一次
-        let now = CACurrentMediaTime()
         if query == lastExecutedQuery, now - lastExecutedAt < 3 {
             return
         }
@@ -234,7 +307,131 @@ final class AskCameraViewModel: ObservableObject {
         lastExecutedAt = now
 
         await execute(query)
-        consumeTranscript(text)
+        consumeTranscript(sourceText)
+    }
+
+    // MARK: - 采集执行
+
+    private func executeCapture(_ command: CaptureCommand) async {
+        switch command {
+        case .cancelPending:
+            guard captureScheduler.hasPendingCountdown else {
+                statusText = "当前没有倒计时"
+                return
+            }
+            captureScheduler.cancelPending()
+            await stopCountdownCues()
+            statusText = "已取消倒计时"
+            speakFeedback("已取消倒计时")
+            resumeListeningIfNeeded()
+
+        case .stopVideo:
+            await stopRecordingAndMaybeResumeListening()
+
+        case .photo(let delay):
+            if delay > 0 {
+                statusText = "\(delay) 秒后拍照"
+                pauseListeningIfNeeded()
+            }
+            captureScheduler.schedulePhoto(
+                delaySeconds: delay,
+                tick: { [weak self] remaining in await self?.playCountdownCue(remaining: remaining) }
+            ) { [weak self] in
+                await self?.stopCountdownCues()
+                await self?.performPhoto()
+                self?.resumeListeningIfNeeded()
+            }
+
+        case .startVideo(let delay, let duration):
+            if camera.isRecording {
+                statusText = "已在录像中"
+                speakFeedback("已在录像中")
+                return
+            }
+            if delay > 0 {
+                statusText = "\(delay) 秒后开始录 \(duration) 秒"
+                pauseListeningIfNeeded()
+            } else {
+                statusText = "准备录制 \(duration) 秒"
+            }
+            captureScheduler.scheduleVideo(
+                delaySeconds: delay,
+                durationSeconds: duration,
+                tick: { [weak self] remaining in await self?.playCountdownCue(remaining: remaining) },
+                start: { [weak self] in
+                    await self?.stopCountdownCues()
+                    await self?.performStartRecording(durationSeconds: duration)
+                },
+                stop: { [weak self] in await self?.stopRecordingAndMaybeResumeListening() }
+            )
+        }
+    }
+
+    private func performPhoto() async {
+        do {
+            statusText = "正在拍照……"
+            try await camera.capturePhoto()
+            statusText = "照片已保存到相册"
+            speakFeedback("已拍照")
+        } catch {
+            statusText = error.localizedDescription
+        }
+    }
+
+    private func performStartRecording(durationSeconds: Int) async {
+        // 策略 A：录像时暂停 ASR，麦克风留给影片音轨
+        pauseListeningIfNeeded()
+
+        do {
+            try await camera.startRecording()
+            captureScheduler.markRecordingStarted()
+            statusText = "正在录像（\(durationSeconds) 秒）"
+            speakFeedback("开始录像")
+        } catch {
+            captureScheduler.clearRecordingTimers()
+            statusText = error.localizedDescription
+            resumeListeningIfNeeded()
+        }
+    }
+
+    private func stopRecordingAndMaybeResumeListening() async {
+        captureScheduler.clearRecordingTimers()
+        guard camera.isRecording else {
+            statusText = "当前没有在录像"
+            return
+        }
+        do {
+            statusText = "正在保存视频……"
+            try await camera.stopRecording()
+            statusText = "视频已保存到相册"
+            speakFeedback("录像完成")
+        } catch {
+            statusText = error.localizedDescription
+        }
+        resumeListeningIfNeeded()
+    }
+
+    /// 为录像 / 倒计时让出麦克风：停止听写，结束后按标记恢复。
+    private func pauseListeningIfNeeded() {
+        guard isListening else { return }
+        resumeListeningAfterIdle = true
+        pauseListeningForCapture()
+    }
+
+    private func resumeListeningIfNeeded() {
+        guard resumeListeningAfterIdle else { return }
+        guard !camera.isRecording, !captureScheduler.isCountingDown else { return }
+        resumeListeningAfterIdle = false
+        startListening()
+    }
+
+    private func pauseListeningForCapture() {
+        listeningTask?.cancel()
+        listeningTask = nil
+        volatileCommandTask?.cancel()
+        Task { await speech.stop() }
+        isListening = false
+        volatileTranscript = ""
     }
 
     private func execute(_ query: DetectionQuery) async {
@@ -366,6 +563,8 @@ final class AskCameraViewModel: ObservableObject {
     // MARK: - 焦点跟随
 
     private func handleTrackingUpdate(_ update: FocusTracker.Update) {
+        // 倒计时闪灯期间不要重配对焦/曝光，避免把手电筒冲掉
+        if captureScheduler.isCountingDown { return }
         switch update {
         case .lost(let generation):
             guard generation == trackingGeneration else { return }
@@ -430,5 +629,50 @@ final class AskCameraViewModel: ObservableObject {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
         feedbackSynthesizer.speak(utterance)
+    }
+
+    /// 每秒按单反节奏滴一声或连滴；闪光灯开启时手电筒与屏幕同步闪。
+    private func playCountdownCue(remaining: Int) async {
+        countdownCueTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runCountdownCue(remaining: remaining)
+        }
+        countdownCueTask = task
+        await task.value
+    }
+
+    private func runCountdownCue(remaining: Int) async {
+        let beeps = CountdownBeeper.beepCount(remaining: remaining)
+        let windowNs: UInt64 = 900_000_000
+        let onMs: UInt64 = remaining <= 2 ? 45 : 60
+        let intervalNs = windowNs / UInt64(max(beeps, 1))
+
+        for i in 0..<beeps {
+            guard !Task.isCancelled else { return }
+            countdownBeeper.play()
+            if countdownTorchEnabled {
+                countdownFlashOn = true
+                Task { await self.camera.setTorchEnabled(true) }
+            }
+            try? await Task.sleep(for: .milliseconds(onMs))
+            if countdownTorchEnabled {
+                countdownFlashOn = false
+                Task { await self.camera.setTorchEnabled(false) }
+            }
+            if i < beeps - 1 {
+                let elapsedOnNs = onMs * 1_000_000
+                let gapNs = intervalNs > elapsedOnNs ? intervalNs - elapsedOnNs : 20_000_000
+                try? await Task.sleep(nanoseconds: gapNs)
+            }
+        }
+    }
+
+    private func stopCountdownCues() async {
+        countdownCueTask?.cancel()
+        countdownCueTask = nil
+        countdownBeeper.stop()
+        countdownFlashOn = false
+        await camera.setTorchEnabled(false)
     }
 }

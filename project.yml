@@ -26,8 +26,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.severuspeng.AskCamera
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_NSCameraUsageDescription: "AskCamera 需要使用相机以提供实时取景与对焦。"
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: "AskCamera 需要使用麦克风识别语音对焦指令，全部语音处理均在设备端完成。"
+        INFOPLIST_KEY_NSCameraUsageDescription: "AskCamera 需要使用相机以提供实时取景、对焦、拍照与录像。"
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "AskCamera 需要使用麦克风进行语音控制，并在录像时录制声音；全部处理均在设备端完成。"
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "AskCamera 需要将拍摄的照片与视频保存到相册。"
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
