@@ -1,12 +1,9 @@
 import Foundation
-#if canImport(FoundationModels)
-import FoundationModels
-#endif
 
 /// 目标词翻译：ASR 输出中文，CLIP 文本编码器只认英文。
 ///
-/// 物体槽保持开放：整词查内置词典 → 离线名词表 → 拼音整词 → 端模型。
-/// 不在句子里做同音滑动替换，避免把小众名吸成常见物。
+/// 仅作端模型不可用时的整词回退：内置词典 → 离线名词表 → 拼音整词。
+/// 不在句子里做同音滑动替换，也不把复合词截成后缀（自行车 ≠ 车）。
 enum TargetTranslator {
 
     /// 常见物体中→英词典。
@@ -259,38 +256,4 @@ enum TargetTranslator {
         return nil
     }
 
-    /// 翻译目标词为 CLIP 可用的英文。无法得到英文时返回 nil（不要把中文丢给 CLIP）。
-    static func translate(_ target: String, allowLanguageModel: Bool = true) async -> String? {
-        let trimmed = target.trimmingCharacters(in: .whitespaces)
-
-        if let hit = lookup(trimmed) {
-            return hit
-        }
-
-        guard allowLanguageModel else { return nil }
-
-        #if canImport(FoundationModels)
-        if #available(iOS 26.0, *) {
-            if case .available = SystemLanguageModel.default.availability {
-                do {
-                    let session = LanguageModelSession(instructions:
-                        "你是翻译器。把用户给出的中文物体名称翻译成英文小写名词短语，只输出翻译结果，不要任何解释。不要改写成更常见的另一种物体。")
-                    let response = try await session.respond(to: trimmed)
-                    let translated = response.content
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .lowercased()
-                    if !translated.isEmpty, translated.count < 50, translated.allSatisfy(\.isASCII) {
-                        print("[TargetTranslator] route=foundation-models-string \(trimmed) → \(translated)")
-                        return translated
-                    }
-                } catch {
-                    print("[TargetTranslator] 端侧模型翻译失败: \(error)")
-                }
-            }
-        }
-        #endif
-
-        print("[TargetTranslator] route=unresolved \(trimmed)")
-        return nil
-    }
 }

@@ -216,9 +216,7 @@ enum FocusIntentParser {
                 }
             }
 
-            if let collapsed = TargetTranslator.collapseToLastObject(target) {
-                target = collapsed
-            }
+            // 物体片段原样留给端模型提取英文；不要用词典把「自行车」截成「车」。
 
             // 「对焦到」「白色的」是半句：不当作裸「对焦」（显著性），也不当作物体名
             if isIncompleteTarget(target) {

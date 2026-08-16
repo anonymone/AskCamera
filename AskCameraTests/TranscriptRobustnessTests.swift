@@ -114,6 +114,20 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertEqual(picked, "对角到平果")
     }
 
+    func testFocusParserKeepsCompoundObjectSpan() {
+        let bicycle = FocusIntentParser.parseCommand("对焦到自行车")
+        guard case .focus(let bicycleIntent) = bicycle else {
+            return XCTFail("expected focus command")
+        }
+        XCTAssertEqual(bicycleIntent.target, "自行车")
+
+        let train = FocusIntentParser.parseCommand("对焦到火车")
+        guard case .focus(let trainIntent) = train else {
+            return XCTFail("expected focus command")
+        }
+        XCTAssertEqual(trainIntent.target, "火车")
+    }
+
     func testCompoundNounIsNotCollapsedToSuffix() async {
         XCTAssertEqual(TargetTranslator.collapseToLastObject("自行车"), "自行车")
         XCTAssertEqual(TargetTranslator.collapseToLastObject("火车"), "火车")
@@ -125,6 +139,8 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertNotEqual(query?.yoloPrompts, ["car"])
         XCTAssertEqual(query?.displayName, "自行车")
     }
+
+    func testQueryUnderstandingRecoversTyposWithoutLanguageModel() async {
         let query = await QueryUnderstanding.resolve("对角到平果", allowLanguageModel: false)
         XCTAssertEqual(query?.action, .focus)
         XCTAssertEqual(query?.yoloPrompts, ["apple"])

@@ -344,7 +344,7 @@ final class AskCameraViewModel: ObservableObject {
             return true
         }
 
-        // volatile：禁用端模型；final：允许 Foundation Models 结构化理解
+        // volatile：禁用端模型（半句）；final：端模型从整句提取主体英文
         guard let query = await QueryUnderstanding.resolve(leftover, allowLanguageModel: isFinal) else {
             return false
         }
