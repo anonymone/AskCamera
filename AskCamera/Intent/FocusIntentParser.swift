@@ -35,23 +35,9 @@ enum FocusIntentParser {
         "复位", "回到中心", "reset focus", "stop tracking", "cancel focus",
     ]
 
-    /// 触发词常见同音误识别 → 规范形式。
-    /// 短指令缺上下文，ASR 极易把"对焦"转成"对角/对交"等，先归一化再匹配。
-    private static let homophoneCorrections: [(String, String)] = [
-        ("对交", "对焦"), ("对角", "对焦"), ("对教", "对焦"), ("对叫", "对焦"),
-        ("对娇", "对焦"), ("兑焦", "对焦"), ("队焦", "对焦"), ("对搅", "对焦"),
-        ("巨焦", "聚焦"), ("据焦", "聚焦"), ("剧焦", "聚焦"), ("橘焦", "聚焦"), ("菊焦", "聚焦"),
-        ("交点", "焦点"), ("教点", "焦点"), ("胶点", "焦点"),
-        ("对住", "对准"), ("对撞", "对准"),
-    ]
-
-    /// 同音误识别归一化。
+    /// 同音 / 近音 / 中文数字归一化（见 `TranscriptNormalizer`）。
     static func normalize(_ text: String) -> String {
-        var normalized = text
-        for (wrong, right) in homophoneCorrections {
-            normalized = normalized.replacingOccurrences(of: wrong, with: right)
-        }
-        return normalized
+        TranscriptNormalizer.normalize(text)
     }
 
     /// 解析语音指令（对焦 / 取消）。非指令返回 nil。

@@ -35,3 +35,25 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
         COREML_CODEGEN_LANGUAGE: None
+  AskCameraTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - AskCameraTests
+    dependencies:
+      - target: AskCamera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.severuspeng.AskCameraTests
+        GENERATE_INFOPLIST_FILE: YES
+        IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+
+schemes:
+  AskCamera:
+    build:
+      targets:
+        AskCamera: all
+        AskCameraTests: [test]
+    test:
+      targets:
+        - AskCameraTests

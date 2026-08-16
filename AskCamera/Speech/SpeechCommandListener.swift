@@ -3,9 +3,10 @@ import Foundation
 import Speech
 
 /// 语音识别事件：volatile 为实时未定稿文本，final 为定稿文本。
+/// `alternatives` 为同段音频的次优转写，解析失败时按序再试。
 enum TranscriptEvent {
-    case volatile(String)
-    case final(String)
+    case volatile(String, alternatives: [String])
+    case final(String, alternatives: [String])
 }
 
 enum SpeechListenerError: LocalizedError {
@@ -63,6 +64,7 @@ final class SpeechCommandListener {
 
         let analyzer = SpeechAnalyzer(modules: [module.speechModule])
         self.analyzer = analyzer
+        try? await analyzer.setContext(SpeechVocabulary.analysisContext())
 
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module.speechModule]) else {
             throw SpeechListenerError.localeNotSupported(locale)
@@ -82,15 +84,13 @@ final class SpeechCommandListener {
                 switch module {
                 case .dictation(let transcriber):
                     for try await result in transcriber.results {
-                        let text = String(result.text.characters)
-                        guard !text.isEmpty else { continue }
-                        eventContinuation.yield(result.isFinal ? .final(text) : .volatile(text))
+                        yieldTranscript(result.text, alternatives: result.alternatives,
+                                        isFinal: result.isFinal, to: eventContinuation)
                     }
                 case .transcription(let transcriber):
                     for try await result in transcriber.results {
-                        let text = String(result.text.characters)
-                        guard !text.isEmpty else { continue }
-                        eventContinuation.yield(result.isFinal ? .final(text) : .volatile(text))
+                        yieldTranscript(result.text, alternatives: result.alternatives,
+                                        isFinal: result.isFinal, to: eventContinuation)
                     }
                 }
             } catch {
@@ -119,14 +119,25 @@ final class SpeechCommandListener {
     // MARK: - 模块创建与资产
 
     private func makeModule(locale: Locale) async throws -> Module {
-        // 短指令场景优先 DictationTranscriber：定稿延迟更低
+        // 短指令场景优先 DictationTranscriber：定稿延迟更低。
+        // 配置对齐 Preset.progressiveShortDictation 的 shortForm + volatile，
+        // 但关掉标点（命令解析更稳），并打开 n-best 以便错字时换候选。
         let dictationLocales = await DictationTranscriber.supportedLocales
         if dictationLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) {
-            let transcriber = DictationTranscriber(locale: locale,
-                                                   contentHints: [.shortForm],
-                                                   transcriptionOptions: [],
-                                                   reportingOptions: [.volatileResults],
-                                                   attributeOptions: [])
+            var contentHints: Set<DictationTranscriber.ContentHint> = [.shortForm]
+            if let lm = SpeechCommandLanguageModel.readyConfiguration(locale: locale) {
+                contentHints.insert(.customizedLanguage(modelConfiguration: lm))
+                print("[SpeechCommandListener] 已加载自定义命令语言模型")
+            } else {
+                SpeechCommandLanguageModel.prepareInBackground(locale: locale)
+            }
+            let transcriber = DictationTranscriber(
+                locale: locale,
+                contentHints: contentHints,
+                transcriptionOptions: [],
+                reportingOptions: [.volatileResults, .alternativeTranscriptions],
+                attributeOptions: []
+            )
             try await ensureAssets(for: transcriber, locale: locale,
                                    installed: await Set(DictationTranscriber.installedLocales.map { $0.identifier(.bcp47) }))
             activeModuleName = "DictationTranscriber"
@@ -138,15 +149,27 @@ final class SpeechCommandListener {
         guard transcriptionLocales.contains(where: { $0.identifier(.bcp47) == locale.identifier(.bcp47) }) else {
             throw SpeechListenerError.localeNotSupported(locale)
         }
-        let transcriber = SpeechTranscriber(locale: locale,
-                                            transcriptionOptions: [],
-                                            reportingOptions: [.volatileResults],
-                                            attributeOptions: [])
+        let transcriber = SpeechTranscriber(
+            locale: locale,
+            transcriptionOptions: [],
+            reportingOptions: [.volatileResults, .alternativeTranscriptions],
+            attributeOptions: []
+        )
         try await ensureAssets(for: transcriber, locale: locale,
                                installed: await Set(SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) }))
         activeModuleName = "SpeechTranscriber"
         print("[SpeechCommandListener] 使用 SpeechTranscriber（长文本模块回退）")
         return .transcription(transcriber)
+    }
+
+    private func yieldTranscript(_ best: AttributedString,
+                                 alternatives: [AttributedString],
+                                 isFinal: Bool,
+                                 to continuation: AsyncStream<TranscriptEvent>.Continuation) {
+        let text = String(best.characters)
+        guard !text.isEmpty else { return }
+        let alts = alternatives.map { String($0.characters) }.filter { !$0.isEmpty && $0 != text }
+        continuation.yield(isFinal ? .final(text, alternatives: alts) : .volatile(text, alternatives: alts))
     }
 
     /// 确认端侧模型已安装，必要时触发系统下载。

@@ -51,22 +51,29 @@ enum TargetTranslator {
         var index: [String: String] = [:]
         for (chinese, english) in dictionary {
             // 先到先得：同音碰撞时保留任意一个（词典内碰撞极少且多为同义）
-            index[pinyin(of: chinese)] = english
+            index[ChineseText.pinyin(of: chinese)] = english
         }
         return index
     }()
 
-    /// 汉字 → 无声调拼音（系统内置转换，无第三方依赖）。
-    private static func pinyin(of text: String) -> String {
-        let mutable = NSMutableString(string: text)
-        CFStringTransform(mutable, nil, kCFStringTransformMandarinLatin, false)
-        CFStringTransform(mutable, nil, kCFStringTransformStripDiacritics, false)
-        return (mutable as String).replacingOccurrences(of: " ", with: "")
+    /// 中文物体词，供 ASR 词汇偏置使用。
+    static var chineseVocabulary: [String] {
+        Array(dictionary.keys)
     }
 
-    /// 同步词典/拼音查找（不含端模型）。命中则返回英文小写名词。
+    /// 中文颜色词。
+    static var chineseColorWords: [String] {
+        colorWords.compactMap { word, _ in
+            word.allSatisfy(\.isASCII) ? nil : word
+        }
+    }
+
+    /// 目标短语末尾的方位虚词，ASR 常没被正则剥掉。
+    private static let trailingLocatives = ["上面", "那里", "这里", "那边", "这边", "上", "里"]
+
+    /// 同步词典/拼音/模糊查找（不含端模型）。命中则返回英文小写名词。
     static func lookup(_ target: String) -> String? {
-        let trimmed = target.trimmingCharacters(in: .whitespaces)
+        let trimmed = stripTrailingLocatives(target.trimmingCharacters(in: .whitespaces))
         guard !trimmed.isEmpty else { return nil }
 
         if trimmed.allSatisfy(\.isASCII) {
@@ -77,10 +84,52 @@ enum TargetTranslator {
         }
         // 单字拼音误伤太多：「到」与「刀」同音 dao，半句「对焦到」会变成 knife
         guard trimmed.count >= 2 else { return nil }
-        if let hit = pinyinIndex[pinyin(of: trimmed)] {
+        let pinyin = ChineseText.pinyin(of: trimmed)
+        if let hit = pinyinIndex[pinyin] {
             return hit
         }
+        return fuzzyLookup(trimmed, pinyin: pinyin)
+    }
+
+    /// ASR 纠错后给 UI 的规范中文名（「平果」→「苹果」）。
+    static func canonicalChinese(for target: String) -> String? {
+        let trimmed = stripTrailingLocatives(target.trimmingCharacters(in: .whitespaces))
+        guard !trimmed.isEmpty, !trimmed.allSatisfy(\.isASCII) else { return nil }
+        if dictionary[trimmed] != nil { return trimmed }
+        guard trimmed.count >= 2 else { return nil }
+        let pinyin = ChineseText.pinyin(of: trimmed)
+        if let chinese = dictionary.first(where: { ChineseText.pinyin(of: $0.key) == pinyin })?.key {
+            return chinese
+        }
+        if let english = fuzzyLookup(trimmed, pinyin: pinyin),
+           let chinese = dictionary.first(where: { $0.value == english && abs($0.key.count - trimmed.count) <= 1 })?.key {
+            return chinese
+        }
         return nil
+    }
+
+    private static func stripTrailingLocatives(_ raw: String) -> String {
+        var target = raw
+        for locative in trailingLocatives where target.hasSuffix(locative) && target.count > locative.count {
+            target = String(target.dropLast(locative.count)).trimmingCharacters(in: .whitespaces)
+        }
+        return target
+    }
+
+    /// 三字及以上才做编辑距离：两字词（杯子/被子）差一个字就会误伤。
+    private static func fuzzyLookup(_ trimmed: String, pinyin: String) -> String? {
+        guard trimmed.count >= 3, pinyin.count >= 6 else { return nil }
+        var bestEnglish: String?
+        var bestDistance = Int.max
+        for (chinese, english) in dictionary {
+            guard abs(chinese.count - trimmed.count) <= 1 else { continue }
+            let distance = ChineseText.levenshtein(ChineseText.pinyin(of: chinese), pinyin)
+            if distance <= 1, distance < bestDistance {
+                bestDistance = distance
+                bestEnglish = english
+            }
+        }
+        return bestEnglish
     }
 
     /// 带颜色/「的」等修饰的短语应走查询理解，不能只取词典里的光杆名词。
@@ -96,8 +145,7 @@ enum TargetTranslator {
         let stripped = target.replacingOccurrences(of: "的", with: "")
             .trimmingCharacters(in: .whitespaces)
         guard !stripped.isEmpty else { return false }
-        return colorWords.contains { stripped.caseInsensitiveCompare($0.0) == .orderedSame
-            || stripped.caseInsensitiveCompare($0.1) == .orderedSame }
+        return colorEnglish(in: stripped) != nil && lastDictionaryNoun(in: stripped) == nil
     }
 
     /// 从连读目标里只留下最后一个「(颜色的)?物体」，避免「白色的鼠标…键盘」把颜色套到后一个词上。
@@ -156,20 +204,54 @@ enum TargetTranslator {
 
     private static func lastDictionaryNoun(in text: String) -> NounHit? {
         var best: NounHit?
+        considerNounHits(in: text, updating: &best, exactCharacters: true)
+        // ASR 把「苹果」写成「平果」时字面匹配失败，按同音窗口再找一次。
+        considerNounHits(in: text, updating: &best, exactCharacters: false)
+        return best
+    }
+
+    private static func considerNounHits(in text: String, updating best: inout NounHit?, exactCharacters: Bool) {
         for (chinese, english) in dictionary {
-            var searchFrom = text.startIndex
-            while let range = text.range(of: chinese, range: searchFrom..<text.endIndex) {
-                let later = best.map { range.lowerBound > $0.range.lowerBound } ?? true
-                let longerSameStart = best.map {
-                    range.lowerBound == $0.range.lowerBound && chinese.count > $0.cn.count
-                } ?? false
-                if later || longerSameStart {
-                    best = NounHit(cn: chinese, en: english, range: range)
+            guard chinese.count >= 2 else {
+                if exactCharacters {
+                    considerExactOccurrences(of: chinese, english: english, in: text, updating: &best)
                 }
-                searchFrom = range.upperBound
+                continue
+            }
+            if exactCharacters {
+                considerExactOccurrences(of: chinese, english: english, in: text, updating: &best)
+                continue
+            }
+            let expectedPinyin = ChineseText.pinyin(of: chinese)
+            var searchFrom = text.startIndex
+            while searchFrom < text.endIndex,
+                  let end = text.index(searchFrom, offsetBy: chinese.count, limitedBy: text.endIndex) {
+                let range = searchFrom..<end
+                let window = String(text[range])
+                if window != chinese, ChineseText.pinyin(of: window) == expectedPinyin {
+                    adoptHit(NounHit(cn: chinese, en: english, range: range), updating: &best)
+                }
+                searchFrom = text.index(after: searchFrom)
             }
         }
-        return best
+    }
+
+    private static func considerExactOccurrences(of chinese: String, english: String, in text: String, updating best: inout NounHit?) {
+        var searchFrom = text.startIndex
+        while let range = text.range(of: chinese, range: searchFrom..<text.endIndex) {
+            adoptHit(NounHit(cn: chinese, en: english, range: range), updating: &best)
+            searchFrom = range.upperBound
+        }
+    }
+
+    private static func adoptHit(_ hit: NounHit, updating best: inout NounHit?) {
+        let later = best.map { hit.range.lowerBound > $0.range.lowerBound } ?? true
+        let longerSameStart = best.map {
+            hit.range.lowerBound == $0.range.lowerBound && hit.cn.count > $0.cn.count
+        } ?? false
+        if later || longerSameStart {
+            best = hit
+        }
     }
 
     private static let colorWords: [(String, String)] = [
@@ -184,6 +266,11 @@ enum TargetTranslator {
         let lowered = text.lowercased()
         for (word, english) in colorWords {
             if lowered.contains(word.lowercased()) { return english }
+        }
+        // 「百色」vs「白色」等同音错字
+        let pinyin = ChineseText.pinyin(of: lowered)
+        for (word, english) in colorWords where !word.allSatisfy(\.isASCII) {
+            if pinyin.contains(ChineseText.pinyin(of: word)) { return english }
         }
         return nil
     }

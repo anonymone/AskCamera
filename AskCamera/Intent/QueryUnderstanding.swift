@@ -42,9 +42,10 @@ enum QueryUnderstanding {
         // 带修饰的短语（白色的鼠标）即使包含词典名词，也走端模型拆 prompt
         if !TargetTranslator.isAttributedPhrase(rawTarget),
            let english = TargetTranslator.lookup(rawTarget) {
+            let display = TargetTranslator.canonicalChinese(for: rawTarget) ?? rawTarget
             log("dictionary", detail: "\(rawTarget) → \(english) spatial=\(intent.spatialHint?.rawValue ?? "none")")
             return .focus(prompts: [english],
-                          displayName: rawTarget,
+                          displayName: display,
                           spatialHint: intent.spatialHint)
         }
 
