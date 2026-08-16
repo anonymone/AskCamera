@@ -39,7 +39,8 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 
 | 目录 | 职责 |
 |---|---|
-| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、点击对焦、`focusPointOfInterest` 控制 |
+| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput） |
+| `AskCamera/Capture` | 拍照/录像语音指令解析、倒计时与定时停止调度 |
 | `AskCamera/Speech` | 基于 iOS 26 `SpeechAnalyzer`/`SpeechTranscriber` 的端侧流式语音识别 |
 | `AskCamera/Intent` | 规则式指令解析（中英文句式、方位修饰）+ 目标词端侧翻译 |
 | `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底 |
@@ -108,9 +109,14 @@ xcodegen generate
 ## 使用
 
 - 点击画面任意位置：手动对焦
+- 底部快门拍照；红色按钮开始/停止录像（未指定时长时默认录 15 秒）
 - 点击麦克风按钮后说：
-  - "对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
+  - 对焦："对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
+  - 拍照："拍照" / "5 秒后拍照"
+  - 录像："开始录像" / "3 秒后开始录 15 秒视频" / "停止录像"
+  - 取消倒计时："取消" / "取消倒计时"（不停止已在进行的录像）
   - 同类多个物体时支持方位修饰："左边的" / "右边的" / "上面的" / "下面的"
   - 只说"对焦"（无目标词）会对焦到画面中最显著的物体
 - 对焦成功后焦点自动跟随目标移动；说"取消对焦"/"停止跟踪"或点击画面可打断
-- 扬声器开关：开启后对焦成功有语音播报（`AVSpeechSynthesizer`，端侧）
+- 录像开始时会暂停语音识别（麦克风留给影片音轨），结束后若此前在听写则自动恢复
+- 扬声器开关：开启后对焦/拍摄成功有语音播报（`AVSpeechSynthesizer`，端侧）
