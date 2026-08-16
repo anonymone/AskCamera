@@ -114,7 +114,17 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertEqual(picked, "对角到平果")
     }
 
-    func testQueryUnderstandingRecoversTyposWithoutLanguageModel() async {
+    func testCompoundNounIsNotCollapsedToSuffix() async {
+        XCTAssertEqual(TargetTranslator.collapseToLastObject("自行车"), "自行车")
+        XCTAssertEqual(TargetTranslator.collapseToLastObject("火车"), "火车")
+        XCTAssertEqual(TargetTranslator.collapseToLastObject("白色的鼠标键盘"), "键盘")
+        XCTAssertEqual(TargetTranslator.lookup("自行车"), "bicycle")
+
+        let query = await QueryUnderstanding.resolve("对焦到自行车", allowLanguageModel: false)
+        XCTAssertEqual(query?.yoloPrompts, ["bicycle"])
+        XCTAssertNotEqual(query?.yoloPrompts, ["car"])
+        XCTAssertEqual(query?.displayName, "自行车")
+    }
         let query = await QueryUnderstanding.resolve("对角到平果", allowLanguageModel: false)
         XCTAssertEqual(query?.action, .focus)
         XCTAssertEqual(query?.yoloPrompts, ["apple"])

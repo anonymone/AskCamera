@@ -222,11 +222,18 @@ enum TargetTranslator {
     }
 
     private static func adoptHit(_ hit: NounHit, updating best: inout NounHit?) {
-        let later = best.map { hit.range.lowerBound > $0.range.lowerBound } ?? true
-        let longerSameStart = best.map {
-            hit.range.lowerBound == $0.range.lowerBound && hit.cn.count > $0.cn.count
-        } ?? false
-        if later || longerSameStart {
+        guard let current = best else {
+            best = hit
+            return
+        }
+        // 「自行车」同时命中「自行车」和后缀「车」：重叠时保留更长的复合词。
+        if hit.range.overlaps(current.range) {
+            if hit.cn.count > current.cn.count {
+                best = hit
+            }
+            return
+        }
+        if hit.range.lowerBound > current.range.lowerBound {
             best = hit
         }
     }
