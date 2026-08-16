@@ -1,30 +1,53 @@
 # AskCamera
 
-语音控制对焦的 iOS 相机应用。对着手机说"对焦到苹果上"，镜头焦点自动落在苹果上。
+语音控制对焦的 iOS 相机应用。对着手机说「对焦到苹果上」，镜头焦点自动落在苹果上；也可以说「拍照」「5 秒后录像」。
 
-**所有 AI 处理均在设备端完成**：语音、图像不出设备，无网络依赖。
+**所有 AI 处理均在设备端完成**：语音、图像不出设备，无网络依赖。Foundation Models 仅在本机 Apple Intelligence 可用时参与查询理解，不可用时走词典与规则回退。
 
 ## 架构
 
 感知 → 决策 → 执行 闭环：
 
 ```
-麦克风 ──► SpeechAnalyzer (iOS 26 端侧流式 ASR)
-              │ 定稿文本
+麦克风 ──► SpeechAnalyzer
+              │ DictationTranscriber（短指令优先；否则 SpeechTranscriber）
+              │ volatile 部分结果 + final 定稿
               ▼
-        FocusIntentParser (规则快路径，提取目标词 + 方位修饰)
-              │ FocusIntent(target: "苹果", spatialHint: .left)
+         leftover 切句（只解析尚未执行的新句子；最后一条指令优先）
+              │
+              ├─► CaptureCommandParser（拍照 / 录像 / 倒计时，规则快路径）
+              └─► QueryUnderstanding（对焦）
+                    │ 规则快筛（触发词 / 取消 / 半句丢弃）
+                    │ 简单名词：词典/拼音 → DetectionQuery
+                    │ 颜色等修饰：Foundation Models @Generable
+                    │   不可用时 → 规则 attributed-fallback（如 white mouse + mouse）
+                    │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
+                    ▼
+相机帧 ──► YOLO-World V2（Core ML，多英文 prompt 槽位）
+              │ 未随包分发模型时降级为 Vision 显著性检测
               ▼
-        TargetTranslator (中→英：词典 / Foundation Models，端侧)
-              │ "apple"
+        方位选择 → 坐标转换（Vision → 预览层 → 设备坐标）
               ▼
-相机帧 ──► YOLO-World V2 (Core ML 开放词汇检测，任意目标词)
-              │ 候选框列表（未随包分发模型时降级为 Vision 显著性检测）
-              ▼
-        方位选择 → 坐标转换 (Vision → 预览层 → 设备坐标)
-              ▼
-        AVCaptureDevice.focusPointOfInterest (驱动镜头对焦)
+        AVCaptureDevice.focusPointOfInterest
+              │
+              └─► 命中后 VNTrackObjectRequest 跟随；跟丢则复位
 ```
+
+未定稿文本解析出完整指令并稳定约 400ms 即执行（词典快路径，不跑端模型）；定稿到达时按 prompts + 方位去重。倒计时与录像期间暂停听写，避免滴声或影片音轨再进 ASR。
+
+### 查询理解
+
+`QueryUnderstanding` 把一句话变成 `DetectionQuery`：给 YOLO-World 的短英文 prompt、给 UI 的中文名、以及左右上下等空间选择（空间关系不写入 YOLO，由选择层消费）。
+
+| 例子 | 路由 | 结果 |
+|---|---|---|
+| 对焦到鼠标 | `dictionary` | prompts `["mouse"]` |
+| 对焦到左边的鼠标 | `dictionary` | `mouse` + `spatial=left` |
+| 对焦到白色的鼠标 | `foundation-models` 或 `attributed-fallback` | `["white mouse", "mouse"]` |
+| 对焦 | 显著性 | Vision 显著物体 |
+| 取消对焦 | `reset` | 停止跟踪，回到画面中心 |
+
+连读或 ASR 把前后句拼在同一段里时：采集指令与对焦指令都只看尚未消费的新句子；目标短语只保留最后一个「(颜色的)?物体」，避免「白色的鼠标…键盘」把颜色套到后一个词上。半句（「对焦到」「白色的」）不会当成裸「对焦」去打显著性。
 
 ### 开放词汇检测
 
@@ -39,11 +62,11 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 
 | 目录 | 职责 |
 |---|---|
-| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput） |
-| `AskCamera/Capture` | 拍照/录像语音指令解析、倒计时与定时停止调度 |
-| `AskCamera/Speech` | 基于 iOS 26 `SpeechAnalyzer`/`SpeechTranscriber` 的端侧流式语音识别 |
-| `AskCamera/Intent` | 规则式指令解析（中英文句式、方位修饰）+ 目标词端侧翻译 |
-| `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底 |
+| `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput）、倒计时手电筒 |
+| `AskCamera/Capture` | 拍照/录像语音指令、倒计时调度、滴声提示（`CountdownBeeper`） |
+| `AskCamera/Speech` | iOS 26 `SpeechAnalyzer`：优先 `DictationTranscriber`，回退 `SpeechTranscriber` |
+| `AskCamera/Intent` | 查询理解：规则快筛 + 词典/拼音 + Foundation Models `@Generable` + 颜色短语回退 |
+| `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底、焦点跟踪 |
 | `AskCamera/App` | SwiftUI 界面与流水线协调（`AskCameraViewModel`） |
 
 ## 路线图
@@ -51,7 +74,8 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 - [x] 阶段一：相机预览 + 点击对焦 + 语音链路（ASR → 意图 → 显著物体对焦）
 - [x] 阶段二：YOLO-World V2 开放词汇检测（Core ML，任意目标词匹配 + 方位修饰选择）
 - [x] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标（节流对焦、跟丢自动复位）
-- [ ] 阶段四：Foundation Models 复杂指令解析（"封面蓝色的那本书"）
+- [x] 阶段四：Foundation Models 查询理解（结构化 `DetectionQuery` → YOLO prompts；简单路径仍走词典；端模型不可用时规则回退）
+- [x] 拍照 / 录像 / 语音倒计时（滴声 + 可选闪光，采集指令优先于对焦）
 - [ ] 阶段五：FastVLM 指代消歧、LiDAR 深度辅助
 
 ## 构建
@@ -65,7 +89,7 @@ xcodegen generate
 open AskCamera.xcodeproj
 ```
 
-选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。
+选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。带颜色/复杂指代的查询理解需要本机 Apple Intelligence；没有时仍可用词典与 `attributed-fallback`。
 
 ## CI：PR 自动构建 IPA
 
@@ -110,13 +134,17 @@ xcodegen generate
 
 - 点击画面任意位置：手动对焦
 - 底部快门拍照；红色按钮开始/停止录像（未指定时长时默认录 15 秒）
-- 点击麦克风按钮后说：
-  - 对焦："对焦到苹果上" / "焦点切到左边的水杯" / "focus on the cup"
-  - 拍照："拍照" / "5 秒后拍照"
-  - 录像："开始录像" / "3 秒后开始录 15 秒视频" / "停止录像"
-  - 取消倒计时："取消" / "取消倒计时"（不停止已在进行的录像）
-  - 同类多个物体时支持方位修饰："左边的" / "右边的" / "上面的" / "下面的"
-  - 只说"对焦"（无目标词）会对焦到画面中最显著的物体
-- 对焦成功后焦点自动跟随目标移动；说"取消对焦"/"停止跟踪"或点击画面可打断
+- 点击麦克风后，底部字幕显示未定稿（灰色）与已定稿转写；说：
+  - 对焦：「对焦到苹果上」/「focus on the cup」
+  - 方位：「对焦到左边的鼠标」/「焦点切到右边的水杯」（同类多个时选左/右/上/下）
+  - 颜色：「对焦到白色的鼠标」（YOLO 同时试 `white mouse` 与 `mouse`）
+  - 拍照：「拍照」/「拍一张」/「5 秒后拍照」
+  - 录像：「开始录像」/「录 15 秒」/「3 秒后开始录 15 秒视频」/「停止录像」
+  - 取消倒计时：「取消」/「取消倒计时」（不停止已在进行的录像）
+  - 只说「对焦」（无目标词）会对焦到画面中最显著的物体
+- 对焦成功后焦点自动跟随目标移动；说「取消对焦」/「停止跟踪」或点击画面可打断
+- 倒计时用滴声提示（越接近结束越密），不念数字，以免再次被识别成指令；手电筒按钮可打开后置灯 + 屏幕闪白
 - 录像开始时会暂停语音识别（麦克风留给影片音轨），结束后若此前在听写则自动恢复
 - 扬声器开关：开启后对焦/拍摄成功有语音播报（`AVSpeechSynthesizer`，端侧）
+- 虫子按钮：调试模式，叠加所有检测候选框与耗时
+- 照片与视频保存到系统相册
