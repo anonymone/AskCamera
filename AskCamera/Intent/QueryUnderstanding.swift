@@ -22,6 +22,7 @@ enum QueryUnderstanding {
 
         switch command {
         case .reset:
+            log("reset", detail: rawText)
             return .reset
         case .focus(let intent):
             return await resolveFocus(intent, allowLanguageModel: allowLanguageModel)
@@ -34,11 +35,14 @@ enum QueryUnderstanding {
                                      allowLanguageModel: Bool) async -> DetectionQuery {
         guard let rawTarget = intent.target?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawTarget.isEmpty else {
+            log("saliency", detail: "无目标词")
             return .saliency()
         }
 
-        // 英文直通 / 词典 / 拼音整词命中 → 不调用端模型
-        if let english = TargetTranslator.lookup(rawTarget) {
+        // 带修饰的短语（白色的鼠标）即使包含词典名词，也走端模型拆 prompt
+        if !TargetTranslator.isAttributedPhrase(rawTarget),
+           let english = TargetTranslator.lookup(rawTarget) {
+            log("dictionary", detail: "\(rawTarget) → \(english) spatial=\(intent.spatialHint?.rawValue ?? "none")")
             return .focus(prompts: [english],
                           displayName: rawTarget,
                           spatialHint: intent.spatialHint)
@@ -48,14 +52,30 @@ enum QueryUnderstanding {
         if allowLanguageModel,
            let generated = await generateWithFoundationModel(rawTarget: rawTarget,
                                                              spatialHint: intent.spatialHint) {
+            log("foundation-models",
+                detail: "target=\(rawTarget) prompts=\(generated.yoloPrompts) spatial=\(generated.spatialHint?.rawValue ?? "none") display=\(generated.displayName)")
             return generated
+        }
+
+        if let fallback = TargetTranslator.attributedFallback(from: rawTarget) {
+            log("attributed-fallback",
+                detail: "\(rawTarget) prompts=\(fallback.prompts)")
+            return .focus(prompts: fallback.prompts,
+                          displayName: fallback.displayName,
+                          spatialHint: intent.spatialHint)
         }
 
         // 回退：异步翻译（可能仍走端模型字符串翻译）+ 规则方位
         let english = await TargetTranslator.translate(rawTarget)
+        let reason = allowLanguageModel ? "FM未命中/不可用" : "volatile禁用端模型"
+        log("translate-fallback", detail: "\(reason) \(rawTarget) → \(english)")
         return .focus(prompts: [english],
                       displayName: rawTarget,
                       spatialHint: intent.spatialHint)
+    }
+
+    private static func log(_ route: String, detail: String) {
+        print("[QueryUnderstanding] route=\(route) \(detail)")
     }
 
     // MARK: - Foundation Models

@@ -130,6 +130,69 @@ enum FocusIntentParser {
         ("left ", .left), ("right ", .right), ("top ", .top), ("bottom ", .bottom),
     ]
 
+    /// 对焦介词，不能当作物体名。
+    private static let locativeParticles = ["到", "在", "至", "向", "准"]
+
+    /// 半句/虚词目标：应等用户说完，而不是立刻对焦。
+    private static let incompleteTargets: Set<String> = [
+        "到", "在", "至", "向", "准", "的", "了", "上", "下", "里", "这", "那",
+    ]
+
+    private static func stripLeadingLocatives(_ raw: String) -> String {
+        var target = raw
+        while let particle = locativeParticles.first(where: { target.hasPrefix($0) }) {
+            target = String(target.dropFirst(particle.count)).trimmingCharacters(in: .whitespaces)
+        }
+        return target
+    }
+
+    static func isIncompleteTarget(_ target: String) -> Bool {
+        if target.isEmpty { return true }
+        if incompleteTargets.contains(target) { return true }
+        // 「白色的」还没说出名词
+        if target.hasSuffix("的") { return true }
+        if locativeParticles.contains(where: { target.hasSuffix($0) }) { return true }
+        if TargetTranslator.isColorOnly(target) { return true }
+        return false
+    }
+
+    /// 连读时第二句常丢掉「对焦」，变成「白色的鼠标到黑色的鼠标」。只留最后一个介词后的物体。
+    private static func lastObjectPhrase(in target: String) -> String {
+        var lastRange: Range<String.Index>?
+        for particle in locativeParticles {
+            var searchFrom = target.startIndex
+            while let range = target.range(of: particle, range: searchFrom..<target.endIndex) {
+                if range.lowerBound > target.startIndex {
+                    lastRange = range
+                }
+                searchFrom = range.upperBound
+            }
+        }
+        if let lastRange {
+            let after = String(target[lastRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if !isIncompleteTarget(after) {
+                return after
+            }
+        }
+        return target
+    }
+
+    /// ASR 下一句「对焦」常只露出一个「对」。
+    private static func stripTrailingTriggerJunk(_ raw: String) -> String {
+        var target = raw
+        let suffixes = ["对焦", "对准", "聚焦", "焦点", "focus", "对", "焦"]
+        var changed = true
+        while changed {
+            changed = false
+            for suffix in suffixes where target.hasSuffix(suffix) && target.count > suffix.count {
+                target = String(target.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+                changed = true
+                break
+            }
+        }
+        return target
+    }
+
     static func parse(_ rawText: String) -> FocusIntent? {
         let text = rawText
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -150,8 +213,14 @@ enum FocusIntentParser {
                 target = target.replacingOccurrences(of: noise, with: "")
             }
             target = target.trimmingCharacters(in: .whitespaces)
+            target = stripLeadingLocatives(target)
+            target = stripTrailingTriggerJunk(target)
+            target = lastObjectPhrase(in: target)
+            target = stripLeadingLocatives(target)
+            while target.hasPrefix("的") {
+                target = String(target.dropFirst()).trimmingCharacters(in: .whitespaces)
+            }
 
-            // 提取方位修饰前缀
             var hint: SpatialHint?
             for (prefix, spatialHint) in spatialPrefixes {
                 if target.lowercased().hasPrefix(prefix) {
@@ -159,6 +228,15 @@ enum FocusIntentParser {
                     target = String(target.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
                     break
                 }
+            }
+
+            if let collapsed = TargetTranslator.collapseToLastObject(target) {
+                target = collapsed
+            }
+
+            // 「对焦到」「白色的」是半句：不当作裸「对焦」（显著性），也不当作物体名
+            if isIncompleteTarget(target) {
+                return nil
             }
 
             return FocusIntent(target: target.isEmpty ? nil : target, spatialHint: hint)

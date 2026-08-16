@@ -71,6 +71,8 @@ final class AskCameraViewModel: ObservableObject {
     private var lastExecutedQuery: DetectionQuery?
     private var lastExecutedCaptureCommand: CaptureCommand?
     private var lastExecutedAt: TimeInterval = 0
+    /// 上次已执行的目标短语，ASR 改写前文时用它从累积转写里切开。
+    private var lastConsumedTarget = ""
     private var countdownCueTask: Task<Void, Never>?
 
     /// 跟踪节流状态。
@@ -159,6 +161,7 @@ final class AskCameraViewModel: ObservableObject {
                 let events = try await speech.start()
                 isListening = true
                 consumedTranscript = ""
+                lastConsumedTarget = ""
                 captionHistory = []
                 volatileTranscript = ""
                 statusText = "正在聆听：对焦 / 拍照 / 录像"
@@ -193,6 +196,7 @@ final class AskCameraViewModel: ObservableObject {
         volatileTranscript = ""
         captionHistory = []
         consumedTranscript = ""
+        lastConsumedTarget = ""
         statusText = "已停止聆听"
     }
 
@@ -214,19 +218,40 @@ final class AskCameraViewModel: ObservableObject {
 
     /// 去掉已执行指令对应的前缀，只留下尚未消费的新句子。
     private func leftoverTranscript(from full: String) -> String {
+        let fullText = full.trimmingCharacters(in: .whitespacesAndNewlines)
         let consumed = consumedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !consumed.isEmpty else {
-            return full.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if full.hasPrefix(consumed) {
-            return String(full.dropFirst(consumed.count))
+        guard !consumed.isEmpty else { return fullText }
+
+        if fullText.hasPrefix(consumed) {
+            return String(fullText.dropFirst(consumed.count))
                 .trimmingCharacters(in: Self.captionTrimCharacters)
         }
-        if let range = full.range(of: consumed) {
-            return String(full[range.upperBound...])
+        if let range = fullText.range(of: consumed, options: .backwards) {
+            let tail = String(fullText[range.upperBound...])
                 .trimmingCharacters(in: Self.captionTrimCharacters)
+            if !tail.isEmpty { return tail }
         }
-        return full.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // ASR 改写前文时，只能按「上次整句指令」切开，不能按 displayName（「鼠标」）。
+        // 否则「对焦到鼠标」之后再说「对焦到左边的鼠标」，会从句尾的「鼠标」切开变成空串。
+        let command = lastConsumedTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        if command.count >= 4, let range = fullText.range(of: command, options: .backwards) {
+            let tail = String(fullText[range.upperBound...])
+                .trimmingCharacters(in: Self.captionTrimCharacters)
+            if Self.containsCommandTrigger(tail) {
+                return tail
+            }
+        }
+        return fullText
+    }
+
+    private static func containsCommandTrigger(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        let triggers = [
+            "对焦", "对准", "聚焦", "焦点", "focus",
+            "拍照", "照相", "拍摄", "录像", "录制", "record",
+        ]
+        return triggers.contains { lowered.contains($0) }
     }
 
     /// 指令已执行：记下已消费原文并清空字幕，下一句从空白开始。
@@ -243,9 +268,10 @@ final class AskCameraViewModel: ObservableObject {
     ///   - leftover: 去掉已执行指令后的新句子，用于解析。
     ///   - sourceText: SpeechAnalyzer 的完整累积原文，执行成功后记入 consumedTranscript。
     private func scheduleVolatileCommand(from leftover: String, sourceText: String) {
+        // 转写一变就取消上一拍，避免半句「对焦到」取消不了已排队的旧指令
+        volatileCommandTask?.cancel()
         guard !leftover.isEmpty else { return }
         if CaptureCommandParser.parse(leftover) != nil {
-            volatileCommandTask?.cancel()
             volatileCommandTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled else { return }
@@ -260,17 +286,24 @@ final class AskCameraViewModel: ObservableObject {
         if case .focus(let intent) = command, intent.target == nil {
             return
         }
-        // 词典未命中的复杂目标留给 final + 端模型，避免用错误英文 prompt 抢跑
-        if case .focus(let intent) = command, let target = intent.target,
+        let isAttributed: Bool = {
+            if case .focus(let intent) = command, let target = intent.target {
+                return TargetTranslator.isAttributedPhrase(target)
+            }
+            return false
+        }()
+        // 词典未命中、且不是已说完的修饰短语：留给定稿。修饰短语（白色的鼠标）
+        // 在 400ms 稳定后直接走端模型，避免等 ASR 定稿一直不触发。
+        if !isAttributed,
+           case .focus(let intent) = command, let target = intent.target,
            TargetTranslator.lookup(target) == nil,
            !target.allSatisfy(\.isASCII) {
             return
         }
-        volatileCommandTask?.cancel()
         volatileCommandTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: false)
+            await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: isAttributed)
         }
     }
 
@@ -285,7 +318,9 @@ final class AskCameraViewModel: ObservableObject {
             }
             lastExecutedCaptureCommand = capture
             lastExecutedAt = now
+            print("[ViewModel] route=capture isFinal=\(isFinal) leftover=\(leftover) command=\(capture)")
             await executeCapture(capture)
+            lastConsumedTarget = leftover
             consumeTranscript(sourceText)
             return
         }
@@ -299,14 +334,19 @@ final class AskCameraViewModel: ObservableObject {
         }
         if query.action == .none { return }
 
-        // volatile 与 final 去重：相同查询 3 秒内只执行一次
-        if query == lastExecutedQuery, now - lastExecutedAt < 3 {
+        // 去重看检测意图，不看 displayName（连读改写会让文案变长但 prompts 相同）
+        if query.action == lastExecutedQuery?.action,
+           query.yoloPrompts == lastExecutedQuery?.yoloPrompts,
+           query.spatialHint == lastExecutedQuery?.spatialHint,
+           now - lastExecutedAt < 3 {
             return
         }
         lastExecutedQuery = query
         lastExecutedAt = now
 
+        print("[ViewModel] route=focus isFinal=\(isFinal) leftover=\(leftover) action=\(query.action) prompts=\(query.yoloPrompts) saliency=\(query.useSaliency)")
         await execute(query)
+        lastConsumedTarget = leftover
         consumeTranscript(sourceText)
     }
 
@@ -500,13 +540,15 @@ final class AskCameraViewModel: ObservableObject {
                                 in frame: CVPixelBuffer) async throws -> [DetectionResult] {
         if !query.useSaliency, !query.yoloPrompts.isEmpty, let yolo = yoloDetector {
             let label = query.yoloPrompts.first ?? query.displayName
+            print("[ViewModel] detect=yolo-world prompts=\(query.yoloPrompts)")
             let results = try await yolo.detect(prompts: query.yoloPrompts, label: label, in: frame)
             if !results.isEmpty {
                 return results
             }
-            // 开放词汇没找到时不静默降级——用户点名的目标不在画面里就该如实报告
+            print("[ViewModel] detect=yolo-world 未找到目标")
             return []
         }
+        print("[ViewModel] detect=saliency display=\(query.displayName)")
         return try await salientDetector.detect(target: query.displayName, in: frame)
     }
 
