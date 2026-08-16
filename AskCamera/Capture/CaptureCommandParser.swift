@@ -3,12 +3,6 @@ import Foundation
 /// 规则式拍照 / 录像指令解析（快路径，不依赖端模型）。
 enum CaptureCommandParser {
 
-    /// 对焦复位关键词：交给对焦链路，避免被「取消」误吞。
-    private static let focusResetKeywords = [
-        "取消对焦", "取消跟踪", "停止对焦", "停止跟踪", "取消聚焦",
-        "复位", "回到中心", "reset focus", "stop tracking", "cancel focus",
-    ]
-
     private static let stopVideoKeywords = [
         "停止录像", "停止录制", "结束录像", "结束录制", "停止视频",
         "stop recording", "stop video", "end recording",
@@ -19,18 +13,43 @@ enum CaptureCommandParser {
         "cancel countdown", "cancel photo",
     ]
 
+    /// 对焦触发词：连续转写里若最后一条指令是对焦，就不要再执行前文的拍照/录像。
+    private static let focusTriggerKeywords = [
+        "取消对焦", "取消跟踪", "停止对焦", "停止跟踪", "取消聚焦",
+        "复位", "回到中心", "reset focus", "stop tracking", "cancel focus",
+        "对焦", "对准", "聚焦", "焦点", "focus",
+    ]
+
+    /// 采集触发词（较长者优先，避免「录像」盖过「停止录像」时的位置比较）。
+    private static let captureTriggerKeywords = [
+        "cancel countdown", "cancel photo",
+        "stop recording", "stop video", "end recording",
+        "start recording", "record video", "start video",
+        "take a photo", "take photo", "capture photo",
+        "取消倒计时", "取消拍照", "取消拍摄",
+        "停止录像", "停止录制", "结束录像", "结束录制", "停止视频",
+        "开始录像", "开始录制", "开始录视频", "录制视频",
+        "拍一张", "拍照", "照相", "拍摄",
+        "别拍了", "不要拍了", "别录了",
+        "录像", "录制", "record",
+    ]
+
     /// 解析采集指令。非采集指令返回 nil（由对焦链路继续处理）。
     static func parse(_ rawText: String) -> CaptureCommand? {
         let text = FocusIntentParser.normalize(rawText)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
 
-        let lowered = text.lowercased()
-
-        // 对焦取消留给 FocusIntentParser
-        if focusResetKeywords.contains(where: { lowered.contains($0) }) {
-            return nil
+        let loweredFull = text.lowercased()
+        // 裸「取消」：只取消倒计时；含对焦词的由 last-command 判断交给对焦链路
+        if loweredFull == "取消" || loweredFull == "cancel" {
+            return .cancelPending
         }
+
+        // SpeechAnalyzer 会把多句拼在同一段里（「对焦到鼠标拍照对焦到杯子」）。
+        // 只解析最后一条采集指令；若最后是对焦，返回 nil 交给 FocusIntentParser。
+        guard let segment = latestCaptureSegment(in: text) else { return nil }
+        let lowered = segment.lowercased()
 
         if stopVideoKeywords.contains(where: { lowered.contains($0) }) {
             return .stopVideo
@@ -39,18 +58,62 @@ enum CaptureCommandParser {
         if cancelPendingKeywords.contains(where: { lowered.contains($0) }) {
             return .cancelPending
         }
-        // 裸「取消」：只取消倒计时（已对齐）；含对焦词的已在上方排除
-        if lowered == "取消" || lowered == "cancel" {
-            return .cancelPending
-        }
 
-        if let video = parseVideo(text, lowered: lowered) {
+        if let video = parseVideo(segment, lowered: lowered) {
             return video
         }
-        if let photo = parsePhoto(text, lowered: lowered) {
+        if let photo = parsePhoto(segment, lowered: lowered) {
             return photo
         }
         return nil
+    }
+
+    // MARK: - Latest command
+
+    private enum CommandKind {
+        case focus, capture
+    }
+
+    private struct CommandHit {
+        let kind: CommandKind
+        let range: Range<String.Index>
+    }
+
+    /// 从上一指令之后切出最后一条采集子句；最后一条是对焦时返回 nil。
+    private static func latestCaptureSegment(in text: String) -> String? {
+        let hits = commandHits(in: text)
+        guard let last = hits.last, last.kind == .capture else { return nil }
+        let start = hits.dropLast().last.map(\.range.upperBound) ?? text.startIndex
+        return String(text[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func commandHits(in text: String) -> [CommandHit] {
+        var hits: [CommandHit] = []
+
+        func consider(_ keywords: [String], kind: CommandKind) {
+            for keyword in keywords {
+                var searchFrom = text.startIndex
+                while let range = text.range(of: keyword, options: .caseInsensitive, range: searchFrom..<text.endIndex) {
+                    hits.append(CommandHit(kind: kind, range: range))
+                    searchFrom = range.upperBound
+                }
+            }
+        }
+
+        consider(focusTriggerKeywords, kind: .focus)
+        consider(captureTriggerKeywords, kind: .capture)
+
+        // 「停止录像」内的「录像」等被更长词包含的命中丢掉，避免把一条指令切成两段
+        let allHits = hits
+        hits = allHits.filter { hit in
+            !allHits.contains { other in
+                other.range != hit.range
+                    && other.range.lowerBound <= hit.range.lowerBound
+                    && other.range.upperBound >= hit.range.upperBound
+            }
+        }
+        hits.sort { $0.range.lowerBound < $1.range.lowerBound }
+        return hits
     }
 
     // MARK: - Photo

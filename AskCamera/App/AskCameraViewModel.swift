@@ -157,8 +157,9 @@ final class AskCameraViewModel: ObservableObject {
                 for await event in events {
                     switch event {
                     case .volatile(let text):
-                        volatileTranscript = leftoverTranscript(from: text)
-                        scheduleVolatileCommand(from: text)
+                        let leftover = leftoverTranscript(from: text)
+                        volatileTranscript = leftover
+                        scheduleVolatileCommand(from: leftover, sourceText: text)
                     case .final(let text):
                         volatileTranscript = ""
                         volatileCommandTask?.cancel()
@@ -166,7 +167,7 @@ final class AskCameraViewModel: ObservableObject {
                         if !leftover.isEmpty {
                             appendCaption(leftover)
                         }
-                        await handleTranscript(text, isFinal: true)
+                        await handleTranscript(leftover, sourceText: text, isFinal: true)
                     }
                 }
             } catch {
@@ -229,18 +230,22 @@ final class AskCameraViewModel: ObservableObject {
 
     /// volatile 快路径：未定稿文本已解析出完整指令时，稳定 400ms 后立即执行，
     /// 不等定稿（定稿往往滞后 1~2 秒）。文本再变化会重置计时。
-    private func scheduleVolatileCommand(from text: String) {
-        if CaptureCommandParser.parse(text) != nil {
+    /// - Parameters:
+    ///   - leftover: 去掉已执行指令后的新句子，用于解析。
+    ///   - sourceText: SpeechAnalyzer 的完整累积原文，执行成功后记入 consumedTranscript。
+    private func scheduleVolatileCommand(from leftover: String, sourceText: String) {
+        guard !leftover.isEmpty else { return }
+        if CaptureCommandParser.parse(leftover) != nil {
             volatileCommandTask?.cancel()
             volatileCommandTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(400))
                 guard !Task.isCancelled else { return }
-                await self?.handleTranscript(text, isFinal: false)
+                await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: false)
             }
             return
         }
 
-        guard let command = FocusIntentParser.parseCommand(text) else { return }
+        guard let command = FocusIntentParser.parseCommand(leftover) else { return }
         // 无目标的裸"对焦"只在定稿时执行：说到一半的"对焦到……"会被暂时解析成
         // 无目标指令，快路径执行会误触发显著性对焦
         if case .focus(let intent) = command, intent.target == nil {
@@ -250,28 +255,29 @@ final class AskCameraViewModel: ObservableObject {
         volatileCommandTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
-            await self?.handleTranscript(text, isFinal: false)
+            await self?.handleTranscript(leftover, sourceText: sourceText, isFinal: false)
         }
     }
 
-    private func handleTranscript(_ text: String, isFinal: Bool) async {
+    private func handleTranscript(_ leftover: String, sourceText: String, isFinal: Bool) async {
+        guard !leftover.isEmpty else { return }
         let now = CACurrentMediaTime()
 
-        // 采集指令优先于对焦
-        if let capture = CaptureCommandParser.parse(text) {
+        // 采集指令优先于对焦；只解析尚未消费的新句子，避免累积转写里的旧「拍照」反复命中
+        if let capture = CaptureCommandParser.parse(leftover) {
             if capture == lastExecutedCaptureCommand, now - lastExecutedAt < 3 {
                 return
             }
             lastExecutedCaptureCommand = capture
             lastExecutedAt = now
             await executeCapture(capture)
-            consumeTranscript(text)
+            consumeTranscript(sourceText)
             return
         }
 
-        guard let command = FocusIntentParser.parseCommand(text) else {
+        guard let command = FocusIntentParser.parseCommand(leftover) else {
             if isFinal {
-                statusText = "\u{201C}\(text)\u{201D}（未识别为指令）"
+                statusText = "\u{201C}\(leftover)\u{201D}（未识别为指令）"
             }
             return
         }
@@ -284,7 +290,7 @@ final class AskCameraViewModel: ObservableObject {
         lastExecutedAt = now
 
         await execute(command)
-        consumeTranscript(text)
+        consumeTranscript(sourceText)
     }
 
     // MARK: - 采集执行
