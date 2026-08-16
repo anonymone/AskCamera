@@ -19,13 +19,16 @@ struct DetectionQuery: Equatable {
     let spatialHint: SpatialHint?
     /// true：无明确物体，走显著性检测。
     let useSaliency: Bool
+    /// true：说出了物体，但无法得到英文 prompt（不要把中文丢给 CLIP）。
+    let objectUnresolved: Bool
 
     static let reset = DetectionQuery(
         action: .reset,
         yoloPrompts: [],
         displayName: "",
         spatialHint: nil,
-        useSaliency: false
+        useSaliency: false,
+        objectUnresolved: false
     )
 
     static let none = DetectionQuery(
@@ -33,7 +36,8 @@ struct DetectionQuery: Equatable {
         yoloPrompts: [],
         displayName: "",
         spatialHint: nil,
-        useSaliency: false
+        useSaliency: false,
+        objectUnresolved: false
     )
 
     static func saliency(displayName: String = "显著物体") -> DetectionQuery {
@@ -42,7 +46,19 @@ struct DetectionQuery: Equatable {
             yoloPrompts: [],
             displayName: displayName,
             spatialHint: nil,
-            useSaliency: true
+            useSaliency: true,
+            objectUnresolved: false
+        )
+    }
+
+    static func unresolved(displayName: String, spatialHint: SpatialHint? = nil) -> DetectionQuery {
+        DetectionQuery(
+            action: .focus,
+            yoloPrompts: [],
+            displayName: displayName,
+            spatialHint: spatialHint,
+            useSaliency: false,
+            objectUnresolved: true
         )
     }
 
@@ -57,7 +73,8 @@ struct DetectionQuery: Equatable {
             yoloPrompts: cleaned,
             displayName: displayName,
             spatialHint: spatialHint,
-            useSaliency: cleaned.isEmpty
+            useSaliency: cleaned.isEmpty,
+            objectUnresolved: false
         )
     }
 }

@@ -1,13 +1,9 @@
 import Foundation
-#if canImport(FoundationModels)
-import FoundationModels
-#endif
 
 /// 目标词翻译：ASR 输出中文，CLIP 文本编码器只认英文。
-/// 三级策略（全部端侧）：
-/// 1. 内置词典（常见物体，零延迟）
-/// 2. Foundation Models 端侧大模型翻译（Apple Intelligence 机型）
-/// 3. 原样返回（英文输入或以上都不可用）
+///
+/// 仅作端模型不可用时的整词回退：内置词典 → 离线名词表 → 拼音整词。
+/// 不在句子里做同音滑动替换，也不把复合词截成后缀（自行车 ≠ 车）。
 enum TargetTranslator {
 
     /// 常见物体中→英词典。
@@ -45,28 +41,39 @@ enum TargetTranslator {
         "山": "mountain", "云": "cloud", "月亮": "moon", "太阳": "sun",
     ]
 
-    /// 拼音 → 英文映射（懒构建）。
-    /// ASR 同音字错误（"苹果"→"平果"）导致词典精确匹配失效，退化到拼音层再查一次。
+    /// 拼音 → 英文（内置词典，优先于离线名词表）。
     private static let pinyinIndex: [String: String] = {
         var index: [String: String] = [:]
         for (chinese, english) in dictionary {
-            // 先到先得：同音碰撞时保留任意一个（词典内碰撞极少且多为同义）
-            index[pinyin(of: chinese)] = english
+            index[ChineseText.pinyin(of: chinese)] = english
         }
         return index
     }()
 
-    /// 汉字 → 无声调拼音（系统内置转换，无第三方依赖）。
-    private static func pinyin(of text: String) -> String {
-        let mutable = NSMutableString(string: text)
-        CFStringTransform(mutable, nil, kCFStringTransformMandarinLatin, false)
-        CFStringTransform(mutable, nil, kCFStringTransformStripDiacritics, false)
-        return (mutable as String).replacingOccurrences(of: " ", with: "")
+    private static let pinyinToChinese: [String: String] = {
+        var index: [String: String] = [:]
+        for chinese in dictionary.keys {
+            let pinyin = ChineseText.pinyin(of: chinese)
+            if index[pinyin] == nil {
+                index[pinyin] = chinese
+            }
+        }
+        return index
+    }()
+
+    /// 中文颜色词（命令框封闭类，可供 ASR 偏置）。
+    static var chineseColorWords: [String] {
+        colorWords.compactMap { word, _ in
+            word.allSatisfy(\.isASCII) ? nil : word
+        }
     }
 
-    /// 同步词典/拼音查找（不含端模型）。命中则返回英文小写名词。
+    /// 目标短语末尾的方位虚词，ASR 常没被正则剥掉。
+    private static let trailingLocatives = ["上面", "那里", "这里", "那边", "这边", "上", "里"]
+
+    /// 整词查找（不含端模型）。命中则返回英文小写名词。
     static func lookup(_ target: String) -> String? {
-        let trimmed = target.trimmingCharacters(in: .whitespaces)
+        let trimmed = stripTrailingLocatives(target.trimmingCharacters(in: .whitespaces))
         guard !trimmed.isEmpty else { return nil }
 
         if trimmed.allSatisfy(\.isASCII) {
@@ -75,12 +82,35 @@ enum TargetTranslator {
         if let hit = dictionary[trimmed] {
             return hit
         }
-        // 单字拼音误伤太多：「到」与「刀」同音 dao，半句「对焦到」会变成 knife
-        guard trimmed.count >= 2 else { return nil }
-        if let hit = pinyinIndex[pinyin(of: trimmed)] {
+        if let hit = NounLexicon.english(exact: trimmed) {
             return hit
         }
-        return nil
+        // 单字拼音误伤太多：「到」与「刀」同音 dao
+        guard trimmed.count >= 2 else { return nil }
+        let pinyin = ChineseText.pinyin(of: trimmed)
+        if let hit = pinyinIndex[pinyin] {
+            return hit
+        }
+        return NounLexicon.english(pinyin: pinyin)
+    }
+
+    /// ASR 纠错后给 UI 的规范中文名（「平果」→「苹果」）。只整词映射。
+    static func canonicalChinese(for target: String) -> String? {
+        let trimmed = stripTrailingLocatives(target.trimmingCharacters(in: .whitespaces))
+        guard !trimmed.isEmpty, !trimmed.allSatisfy(\.isASCII) else { return nil }
+        if dictionary[trimmed] != nil { return trimmed }
+        if NounLexicon.english(exact: trimmed) != nil { return trimmed }
+        guard trimmed.count >= 2 else { return nil }
+        let pinyin = ChineseText.pinyin(of: trimmed)
+        return pinyinToChinese[pinyin] ?? NounLexicon.canonicalChinese(pinyin: pinyin)
+    }
+
+    private static func stripTrailingLocatives(_ raw: String) -> String {
+        var target = raw
+        for locative in trailingLocatives where target.hasSuffix(locative) && target.count > locative.count {
+            target = String(target.dropLast(locative.count)).trimmingCharacters(in: .whitespaces)
+        }
+        return target
     }
 
     /// 带颜色/「的」等修饰的短语应走查询理解，不能只取词典里的光杆名词。
@@ -96,8 +126,7 @@ enum TargetTranslator {
         let stripped = target.replacingOccurrences(of: "的", with: "")
             .trimmingCharacters(in: .whitespaces)
         guard !stripped.isEmpty else { return false }
-        return colorWords.contains { stripped.caseInsensitiveCompare($0.0) == .orderedSame
-            || stripped.caseInsensitiveCompare($0.1) == .orderedSame }
+        return colorEnglish(in: stripped) != nil && lastDictionaryNoun(in: stripped) == nil
     }
 
     /// 从连读目标里只留下最后一个「(颜色的)?物体」，避免「白色的鼠标…键盘」把颜色套到后一个词上。
@@ -130,22 +159,41 @@ enum TargetTranslator {
 
         var nounCN: String?
         var nounEN: String?
-        for (chinese, english) in dictionary {
+        var rawNoun = ""
+        for (chinese, english) in allExactPairs() {
             if collapsed.hasSuffix(chinese), chinese.count >= 1 {
                 if nounCN == nil || chinese.count > nounCN!.count {
                     nounCN = chinese
                     nounEN = english
+                    rawNoun = chinese
                 }
             }
         }
-        guard let nounCN, let nounEN else { return nil }
+        if nounEN == nil, let remainder = remainderAfterColor(collapsed), let english = lookup(remainder) {
+            nounCN = canonicalChinese(for: remainder) ?? remainder
+            nounEN = english
+            rawNoun = remainder
+        }
+        guard let nounCN, let nounEN, !rawNoun.isEmpty else { return nil }
 
         var prompts = [nounEN]
-        let prefix = String(collapsed.dropLast(nounCN.count))
+        let prefix = String(collapsed.dropLast(rawNoun.count))
         if let color = colorEnglish(in: prefix) {
             prompts.insert("\(color) \(nounEN)", at: 0)
+            let colorLabel = prefix.hasSuffix("的") ? String(prefix.dropLast()) : prefix
+            return (prompts, "\(colorLabel)的\(nounCN)")
         }
         return (prompts, collapsed)
+    }
+
+    private static func remainderAfterColor(_ text: String) -> String? {
+        guard let delimiter = text.lastIndex(of: "的") else { return nil }
+        let after = String(text[text.index(after: delimiter)...]).trimmingCharacters(in: .whitespaces)
+        return after.isEmpty ? nil : after
+    }
+
+    private static func allExactPairs() -> [(String, String)] {
+        dictionary.map { ($0.key, $0.value) } + NounLexicon.exactPairs
     }
 
     private struct NounHit {
@@ -156,20 +204,35 @@ enum TargetTranslator {
 
     private static func lastDictionaryNoun(in text: String) -> NounHit? {
         var best: NounHit?
-        for (chinese, english) in dictionary {
-            var searchFrom = text.startIndex
-            while let range = text.range(of: chinese, range: searchFrom..<text.endIndex) {
-                let later = best.map { range.lowerBound > $0.range.lowerBound } ?? true
-                let longerSameStart = best.map {
-                    range.lowerBound == $0.range.lowerBound && chinese.count > $0.cn.count
-                } ?? false
-                if later || longerSameStart {
-                    best = NounHit(cn: chinese, en: english, range: range)
-                }
-                searchFrom = range.upperBound
-            }
+        for (chinese, english) in allExactPairs() {
+            considerExactOccurrences(of: chinese, english: english, in: text, updating: &best)
         }
         return best
+    }
+
+    private static func considerExactOccurrences(of chinese: String, english: String, in text: String, updating best: inout NounHit?) {
+        var searchFrom = text.startIndex
+        while let range = text.range(of: chinese, range: searchFrom..<text.endIndex) {
+            adoptHit(NounHit(cn: chinese, en: english, range: range), updating: &best)
+            searchFrom = range.upperBound
+        }
+    }
+
+    private static func adoptHit(_ hit: NounHit, updating best: inout NounHit?) {
+        guard let current = best else {
+            best = hit
+            return
+        }
+        // 「自行车」同时命中「自行车」和后缀「车」：重叠时保留更长的复合词。
+        if hit.range.overlaps(current.range) {
+            if hit.cn.count > current.cn.count {
+                best = hit
+            }
+            return
+        }
+        if hit.range.lowerBound > current.range.lowerBound {
+            best = hit
+        }
     }
 
     private static let colorWords: [(String, String)] = [
@@ -185,41 +248,12 @@ enum TargetTranslator {
         for (word, english) in colorWords {
             if lowered.contains(word.lowercased()) { return english }
         }
+        // 「百色」vs「白色」等同音错字
+        let pinyin = ChineseText.pinyin(of: lowered)
+        for (word, english) in colorWords where !word.allSatisfy(\.isASCII) {
+            if pinyin.contains(ChineseText.pinyin(of: word)) { return english }
+        }
         return nil
     }
 
-    /// 翻译目标词为 CLIP 可用的英文。全程端侧。
-    static func translate(_ target: String) async -> String {
-        let trimmed = target.trimmingCharacters(in: .whitespaces)
-
-        if let hit = lookup(trimmed) {
-            return hit
-        }
-
-        // Foundation Models 端侧翻译（Apple Intelligence 机型）
-        #if canImport(FoundationModels)
-        if #available(iOS 26.0, *) {
-            if case .available = SystemLanguageModel.default.availability {
-                do {
-                    let session = LanguageModelSession(instructions:
-                        "你是翻译器。把用户给出的中文物体名称翻译成英文小写名词短语，只输出翻译结果，不要任何解释。")
-                    let response = try await session.respond(to: trimmed)
-                    let translated = response.content
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                        .lowercased()
-                    if !translated.isEmpty, translated.count < 50 {
-                        print("[TargetTranslator] route=foundation-models-string \(trimmed) → \(translated)")
-                        return translated
-                    }
-                } catch {
-                    print("[TargetTranslator] 端侧模型翻译失败: \(error)")
-                }
-            }
-        }
-        #endif
-
-        // 兜底：原样返回（CLIP 对中文效果差，但不至于崩溃）
-        print("[TargetTranslator] route=passthrough \(trimmed)")
-        return trimmed
-    }
 }

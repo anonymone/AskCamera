@@ -2,26 +2,30 @@
 
 语音控制对焦的 iOS 相机应用。对着手机说「对焦到苹果上」，镜头焦点自动落在苹果上；也可以说「拍照」「5 秒后录像」。
 
-**所有 AI 处理均在设备端完成**：语音、图像不出设备，无网络依赖。Foundation Models 仅在本机 Apple Intelligence 可用时参与查询理解，不可用时走词典与规则回退。
+**所有 AI 处理均在设备端完成**：语音、图像不出设备，无网络依赖。定稿后由本机 Foundation Models 理解动作（对焦/拍照/录像）并抽出主体英文给 YOLO；Apple Intelligence 不可用时才走关键词规则与词典整词回退。
 
 ## 架构
 
 感知 → 决策 → 执行 闭环：
 
 ```
-麦克风 ──► SpeechAnalyzer
+麦克风 ──► SpeechAnalyzer（只偏置命令框）
               │ DictationTranscriber（短指令优先；否则 SpeechTranscriber）
-              │ volatile 部分结果 + final 定稿
+              │ contextualStrings / 自定义 LM：对焦·拍照·录像，不含物体名
+              │ n-best：主结果能执行则用主结果
+              │ 定稿后 finalize + start 新输入，下一句从空白开始
               ▼
-         leftover 切句（只解析尚未执行的新句子；最后一条指令优先）
+         TranscriptNormalizer（只改触发词同音 + 中文数字）
+              ▼
+         leftover 切句 → 槽位解析
+              │  规则快路径：常见「对焦/拍照/录像」；光杆「鼠标」不执行
+              │  定稿：规则未命中则端模型理解非正式说法
               │
-              ├─► CaptureCommandParser（拍照 / 录像 / 倒计时，规则快路径）
-              └─► QueryUnderstanding（对焦）
-                    │ 规则快筛（触发词 / 取消 / 半句丢弃）
-                    │ 简单名词：词典/拼音 → DetectionQuery
-                    │ 颜色等修饰：Foundation Models @Generable
-                    │   不可用时 → 规则 attributed-fallback（如 white mouse + mouse）
-                    │ DetectionQuery(yoloPrompts, spatialHint, displayName, …)
+              └─► QueryUnderstanding.understand
+                    │  CaptureCommandParser / FocusIntentParser（关键词快路径）
+                    │  定稿：端模型判断动作 + 提取主体英文 YOLO prompt
+                    │  无端模型：整词词典 / 离线名词表 / 拼音
+                    │  仍无英文：unresolved，不把中文丢给 CLIP
                     ▼
 相机帧 ──► YOLO-World V2（Core ML，多英文 prompt 槽位）
               │ 未随包分发模型时降级为 Vision 显著性检测
@@ -33,21 +37,45 @@
               └─► 命中后 VNTrackObjectRequest 跟随；跟丢则复位
 ```
 
-未定稿文本解析出完整指令并稳定约 400ms 即执行（词典快路径，不跑端模型）；定稿到达时按 prompts + 方位去重。倒计时与录像期间暂停听写，避免滴声或影片音轨再进 ASR。
+未定稿文本解析出完整指令并稳定约 400ms 即执行（词典快路径，不跑端模型）；定稿到达时按 prompts + 方位去重，然后重置识别输入。倒计时与录像期间暂停听写，避免滴声或影片音轨再进 ASR。
 
 ### 查询理解
 
-`QueryUnderstanding` 把一句话变成 `DetectionQuery`：给 YOLO-World 的短英文 prompt、给 UI 的中文名、以及左右上下等空间选择（空间关系不写入 YOLO，由选择层消费）。
+`QueryUnderstanding` 把一句话变成 `SpokenIntent`（拍照/录像或对焦 `DetectionQuery`）。
+
+规则层覆盖常见说法，让未定稿文本能立刻执行。定稿时：若规则没认出来，端模型从整句判断动作，并抽出主体英文（而不是用词典在句子里截词，否则「自行车」会被收成「车」）。没有 Apple Intelligence 时，非正式说法不会执行。
 
 | 例子 | 路由 | 结果 |
 |---|---|---|
-| 对焦到鼠标 | `dictionary` | prompts `["mouse"]` |
-| 对焦到左边的鼠标 | `dictionary` | `mouse` + `spatial=left` |
+| 对焦到自行车 | `foundation-models`（无端模型时 `dictionary`） | prompts `["bicycle"]`，不是 `car` |
+| 镜头对着自行车 | 定稿 `foundation-models-open` | 同上；规则层不认 |
+| 给它来一张 | 定稿端模型 | 拍照；规则层不认「来一张」 |
+| 对焦到鼠标 | 同上 | prompts `["mouse"]` |
+| 对焦到左边的鼠标 | 端模型或词典 | `mouse` + `spatial=left` |
 | 对焦到白色的鼠标 | `foundation-models` 或 `attributed-fallback` | `["white mouse", "mouse"]` |
+| 对焦到订书机 | 端模型或名词表 | prompts `["stapler"]` |
+| 拍照 / 怕照 | 采集规则 | 立即拍照 |
 | 对焦 | 显著性 | Vision 显著物体 |
+| 鼠标 | 忽略 | 光杆名词不是指令 |
 | 取消对焦 | `reset` | 停止跟踪，回到画面中心 |
 
-连读或 ASR 把前后句拼在同一段里时：采集指令与对焦指令都只看尚未消费的新句子；目标短语只保留最后一个「(颜色的)?物体」，避免「白色的鼠标…键盘」把颜色套到后一个词上。半句（「对焦到」「白色的」）不会当成裸「对焦」去打显著性。
+连读或 ASR 把前后句拼在同一段里时：采集指令与对焦指令都只看尚未消费的新句子。定稿无论成功失败都会消费该句，并重启识别输入，避免「嗯那个」粘上下一句「对焦到自行车」。半句（「对焦到」「白色的」）不会当成裸「对焦」去打显著性。无端模型时，带颜色的短语才用词典回退，且重叠命中保留更长的复合词。
+
+### 语音识别容错
+
+命令槽封闭、物体槽开放。短指令缺上下文，端侧听写容易把「对焦 / 拍照」写成同音错字；物体名则应保持用户说的那个词，不能吸成词典里的常见物。
+
+| 层 | 做法 | 解决什么 |
+|---|---|---|
+| 识别偏置 | `contextualStrings` 与自定义 LM **只含命令句式**（对焦/拍照/录像/方位），不含苹果、鼠标 | 听清这是一句指令，不把「订书机」听成常见物 |
+| n-best | 主结果能执行就用主结果；定稿时非正式整句也保留给端模型，不被次优「拍照」抢走 | 「对焦到鼠标」不会被次优「拍照」抢走；「镜头对着自行车」不会改成拍照 |
+| 会话重置 | 每条定稿后 `finalize(through:)` 再 `start` 新输入；解析失败也消费该句 | 「嗯那个」不会粘上下一句「对焦到自行车」 |
+| 文本归一化 | 拼音/近音只改触发词；「五秒后拍照」→ `5秒后拍照`；介词后的同音词当物体 | 「对角到…」「怕照」；「对焦到牌照」仍是牌照 |
+| 动作与物体 | 常见说法走关键词规则；定稿由端模型理解非正式动作并抽出主体英文。无端模型时整词词典 / `Models/zh_en_nouns.json` / 拼音 | 「镜头对着自行车」→ bicycle；「给它来一张」→ 拍照；中文绝不进 CLIP |
+
+光杆「鼠标」不是指令。必须说出对焦/拍照/录像这类请求（正式或口语都行）。没有英文 prompt 时提示无法检测，不会误对焦到显著物体。
+
+不采用：云端 Whisper；`SpeechTranscriber` 长文本模块；继续加同音错字表。
 
 ### 开放词汇检测
 
@@ -64,8 +92,8 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 |---|---|
 | `AskCamera/Camera` | `AVCaptureSession` 采集、预览、对焦、拍照（PhotoOutput）、录像（MovieFileOutput）、倒计时手电筒 |
 | `AskCamera/Capture` | 拍照/录像语音指令、倒计时调度、滴声提示（`CountdownBeeper`） |
-| `AskCamera/Speech` | iOS 26 `SpeechAnalyzer`：优先 `DictationTranscriber`，回退 `SpeechTranscriber` |
-| `AskCamera/Intent` | 查询理解：规则快筛 + 词典/拼音 + Foundation Models `@Generable` + 颜色短语回退 |
+| `AskCamera/Speech` | iOS 26 `SpeechAnalyzer`：命令框偏置 + n-best；优先 `DictationTranscriber` |
+| `AskCamera/Intent` | 规则快路径 + 定稿端模型理解动作/主体英文；无法得到英文则 unresolved |
 | `AskCamera/Detection` | YOLO-World 开放词汇检测（CLIP 分词/编码 + 检测 + NMS）、Vision 显著性兜底、焦点跟踪 |
 | `AskCamera/App` | SwiftUI 界面与流水线协调（`AskCameraViewModel`） |
 
@@ -74,8 +102,9 @@ YOLO-World 拆分为两个 Core ML 模型，词汇不固化：
 - [x] 阶段一：相机预览 + 点击对焦 + 语音链路（ASR → 意图 → 显著物体对焦）
 - [x] 阶段二：YOLO-World V2 开放词汇检测（Core ML，任意目标词匹配 + 方位修饰选择）
 - [x] 阶段三：`VNTrackObjectRequest` 焦点跟随移动目标（节流对焦、跟丢自动复位）
-- [x] 阶段四：Foundation Models 查询理解（结构化 `DetectionQuery` → YOLO prompts；简单路径仍走词典；端模型不可用时规则回退）
+- [x] 阶段四：Foundation Models 理解动作并从整句提取主体英文（非正式说法在定稿时执行；无端模型时关键词 + 词典回退）
 - [x] 拍照 / 录像 / 语音倒计时（滴声 + 可选闪光，采集指令优先于对焦）
+- [x] 语音识别容错：命令封闭、物体开放（命令偏置 + 离线名词表 + 整词拼音）
 - [ ] 阶段五：FastVLM 指代消歧、LiDAR 深度辅助
 
 ## 构建
@@ -89,7 +118,14 @@ xcodegen generate
 open AskCamera.xcodeproj
 ```
 
-选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。带颜色/复杂指代的查询理解需要本机 Apple Intelligence；没有时仍可用词典与 `attributed-fallback`。
+转写容错的单元测试（不需要真机麦克风）：
+
+```bash
+xcodegen generate
+xcodebuild test -scheme AskCamera -destination 'platform=iOS Simulator,name=iPhone 16' -only-testing:AskCameraTests
+```
+
+选择你的开发者签名后在真机上运行。首次开启麦克风时系统会自动下载中文语音模型（一次性下载，之后完全离线）。非正式说法（「镜头对着…」「来一张」）需要本机 Apple Intelligence；没有时仍可用「对焦到…」「拍照」「录像」等规则句式。
 
 ## CI：PR 自动构建 IPA
 
@@ -135,11 +171,11 @@ xcodegen generate
 - 点击画面任意位置：手动对焦
 - 底部快门拍照；红色按钮开始/停止录像（未指定时长时默认录 15 秒）
 - 点击麦克风后，底部字幕显示未定稿（灰色）与已定稿转写；说：
-  - 对焦：「对焦到苹果上」/「focus on the cup」
+  - 对焦：「对焦到苹果上」/「镜头对着自行车」/「focus on the cup」（口语说法需本机 Apple Intelligence）
   - 方位：「对焦到左边的鼠标」/「焦点切到右边的水杯」（同类多个时选左/右/上/下）
   - 颜色：「对焦到白色的鼠标」（YOLO 同时试 `white mouse` 与 `mouse`）
-  - 拍照：「拍照」/「拍一张」/「5 秒后拍照」
-  - 录像：「开始录像」/「录 15 秒」/「3 秒后开始录 15 秒视频」/「停止录像」
+  - 拍照：「拍照」/「拍一张」/「给它来一张」/「5 秒后拍照」
+  - 录像：「开始录像」/「录一下」/「录 15 秒」/「停止录像」
   - 取消倒计时：「取消」/「取消倒计时」（不停止已在进行的录像）
   - 只说「对焦」（无目标词）会对焦到画面中最显著的物体
 - 对焦成功后焦点自动跟随目标移动；说「取消对焦」/「停止跟踪」或点击画面可打断
