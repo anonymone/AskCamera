@@ -194,6 +194,7 @@ final class CameraManager: NSObject, ObservableObject {
         sessionQueue.async { [self] in
             guard let device else { return }
             do {
+                let torchWasOn = device.hasTorch && device.torchMode == .on
                 try device.lockForConfiguration()
                 if device.isFocusPointOfInterestSupported {
                     device.focusPointOfInterest = point
@@ -204,6 +205,10 @@ final class CameraManager: NSObject, ObservableObject {
                     device.exposureMode = device.isExposureModeSupported(.continuousAutoExposure) ? .continuousAutoExposure : .autoExpose
                 }
                 device.isSubjectAreaChangeMonitoringEnabled = true
+                // 对焦会重配曝光，可能把手电筒打灭；倒计时闪烁期间需要保持灯态
+                if torchWasOn, device.isTorchAvailable, device.isTorchModeSupported(.on) {
+                    try device.setTorchModeOn(level: min(AVCaptureDevice.maxAvailableTorchLevel, 1.0))
+                }
                 device.unlockForConfiguration()
             } catch {
                 print("[CameraManager] 对焦配置失败: \(error)")
@@ -213,6 +218,39 @@ final class CameraManager: NSObject, ObservableObject {
 
     func resetFocusToCenter() {
         focus(atDevicePoint: CGPoint(x: 0.5, y: 0.5))
+    }
+
+    // MARK: - 倒计时手电筒
+
+    /// 开关后置手电筒。倒计时结束后、取消时必须关掉，以免影响拍照曝光。
+    func setTorchEnabled(_ on: Bool) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            sessionQueue.async { [self] in
+                defer { cont.resume() }
+                applyTorch(on)
+            }
+        }
+    }
+
+    /// 在 session 队列上改手电筒，供对焦配置时保持当前灯态。
+    private func applyTorch(_ on: Bool) {
+        guard let device, device.hasTorch else { return }
+        guard device.isTorchModeSupported(on ? .on : .off) else { return }
+        if on, !device.isTorchAvailable {
+            print("[CameraManager] 手电筒暂不可用（过热或被占用）")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            if on {
+                try device.setTorchModeOn(level: min(AVCaptureDevice.maxAvailableTorchLevel, 1.0))
+            } else {
+                device.torchMode = .off
+            }
+            device.unlockForConfiguration()
+        } catch {
+            print("[CameraManager] 手电筒切换失败: \(error)")
+        }
     }
 
     // MARK: - 拍照

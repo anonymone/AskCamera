@@ -18,9 +18,11 @@ final class CaptureScheduler: ObservableObject {
 
     var hasPendingCountdown: Bool { isCountingDown }
 
-    /// 安排拍照：delay 秒倒计时后调用 `fire`。
-    func schedulePhoto(delaySeconds: Int, fire: @escaping @MainActor () async -> Void) {
-        beginCountdown(delaySeconds: delaySeconds) {
+    /// 安排拍照：delay 秒倒计时后调用 `fire`。`tick` 每秒触发一次（含第一秒）。
+    func schedulePhoto(delaySeconds: Int,
+                       tick: (@MainActor (Int) async -> Void)? = nil,
+                       fire: @escaping @MainActor () async -> Void) {
+        beginCountdown(delaySeconds: delaySeconds, tick: tick) {
             await fire()
         }
     }
@@ -28,9 +30,10 @@ final class CaptureScheduler: ObservableObject {
     /// 安排录像：delay 秒后 `start`，再过 duration 秒自动 `stop`（可被手动 stop 取消定时）。
     func scheduleVideo(delaySeconds: Int,
                        durationSeconds: Int,
+                       tick: (@MainActor (Int) async -> Void)? = nil,
                        start: @escaping @MainActor () async -> Void,
                        stop: @escaping @MainActor () async -> Void) {
-        beginCountdown(delaySeconds: delaySeconds) { [weak self] in
+        beginCountdown(delaySeconds: delaySeconds, tick: tick) { [weak self] in
             guard let self else { return }
             await start()
             self.armDuration(seconds: durationSeconds, stop: stop)
@@ -69,7 +72,9 @@ final class CaptureScheduler: ObservableObject {
 
     // MARK: - Private
 
-    private func beginCountdown(delaySeconds: Int, fire: @escaping @MainActor () async -> Void) {
+    private func beginCountdown(delaySeconds: Int,
+                                tick: (@MainActor (Int) async -> Void)?,
+                                fire: @escaping @MainActor () async -> Void) {
         cancelPending()
         generation += 1
         let gen = generation
@@ -87,6 +92,10 @@ final class CaptureScheduler: ObservableObject {
             var left = delay
             while left > 0 {
                 self.countdownRemaining = left
+                // 提示与 1 秒等待并行，避免闪光灯连闪把倒计时拉长
+                if let tick {
+                    Task { await tick(left) }
+                }
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, gen == self.generation else { return }
                 left -= 1

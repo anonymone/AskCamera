@@ -15,6 +15,7 @@ final class AskCameraViewModel: ObservableObject {
     private var yoloDetector: YOLOWorldDetector?
     private let tracker = FocusTracker()
     private let feedbackSynthesizer = AVSpeechSynthesizer()
+    private let countdownBeeper = CountdownBeeper()
     private var cancellables = Set<AnyCancellable>()
 
     // MARK: - UI 状态
@@ -24,9 +25,13 @@ final class AskCameraViewModel: ObservableObject {
     @Published var isListening = false
     @Published var focusHighlight: FocusHighlight?
     @Published var voiceFeedbackEnabled = false
+    /// 倒计时用后置手电筒 + 屏幕闪白，模拟相机自拍灯。
+    @Published var countdownTorchEnabled = false
+    /// 倒计时滴声同步的屏幕闪白。
+    @Published private(set) var countdownFlashOn = false
     @Published private(set) var openVocabularyReady = false
-    /// 录像前是否在听写；停录后自动恢复。
-    private var resumeListeningAfterRecording = false
+    /// 倒计时 / 录像结束后是否恢复听写。
+    private var resumeListeningAfterIdle = false
 
     /// 调试模式：显示所有候选框、分数与各环节耗时。
     @Published var debugMode = false
@@ -66,6 +71,7 @@ final class AskCameraViewModel: ObservableObject {
     private var lastExecutedFocusCommand: FocusCommand?
     private var lastExecutedCaptureCommand: CaptureCommand?
     private var lastExecutedAt: TimeInterval = 0
+    private var countdownCueTask: Task<Void, Never>?
 
     /// 跟踪节流状态。
     private var trackedLabel = ""
@@ -303,8 +309,10 @@ final class AskCameraViewModel: ObservableObject {
                 return
             }
             captureScheduler.cancelPending()
+            await stopCountdownCues()
             statusText = "已取消倒计时"
             speakFeedback("已取消倒计时")
+            resumeListeningIfNeeded()
 
         case .stopVideo:
             await stopRecordingAndMaybeResumeListening()
@@ -312,10 +320,15 @@ final class AskCameraViewModel: ObservableObject {
         case .photo(let delay):
             if delay > 0 {
                 statusText = "\(delay) 秒后拍照"
-                speakFeedback("\(delay)秒后拍照")
+                pauseListeningIfNeeded()
             }
-            captureScheduler.schedulePhoto(delaySeconds: delay) { [weak self] in
+            captureScheduler.schedulePhoto(
+                delaySeconds: delay,
+                tick: { [weak self] remaining in await self?.playCountdownCue(remaining: remaining) }
+            ) { [weak self] in
+                await self?.stopCountdownCues()
                 await self?.performPhoto()
+                self?.resumeListeningIfNeeded()
             }
 
         case .startVideo(let delay, let duration):
@@ -326,14 +339,18 @@ final class AskCameraViewModel: ObservableObject {
             }
             if delay > 0 {
                 statusText = "\(delay) 秒后开始录 \(duration) 秒"
-                speakFeedback("\(delay)秒后开始录像")
+                pauseListeningIfNeeded()
             } else {
                 statusText = "准备录制 \(duration) 秒"
             }
             captureScheduler.scheduleVideo(
                 delaySeconds: delay,
                 durationSeconds: duration,
-                start: { [weak self] in await self?.performStartRecording(durationSeconds: duration) },
+                tick: { [weak self] remaining in await self?.playCountdownCue(remaining: remaining) },
+                start: { [weak self] in
+                    await self?.stopCountdownCues()
+                    await self?.performStartRecording(durationSeconds: duration)
+                },
                 stop: { [weak self] in await self?.stopRecordingAndMaybeResumeListening() }
             )
         }
@@ -352,12 +369,7 @@ final class AskCameraViewModel: ObservableObject {
 
     private func performStartRecording(durationSeconds: Int) async {
         // 策略 A：录像时暂停 ASR，麦克风留给影片音轨
-        if isListening {
-            resumeListeningAfterRecording = true
-            pauseListeningForRecording()
-        } else {
-            resumeListeningAfterRecording = false
-        }
+        pauseListeningIfNeeded()
 
         do {
             try await camera.startRecording()
@@ -367,10 +379,7 @@ final class AskCameraViewModel: ObservableObject {
         } catch {
             captureScheduler.clearRecordingTimers()
             statusText = error.localizedDescription
-            if resumeListeningAfterRecording {
-                resumeListeningAfterRecording = false
-                startListening()
-            }
+            resumeListeningIfNeeded()
         }
     }
 
@@ -388,14 +397,24 @@ final class AskCameraViewModel: ObservableObject {
         } catch {
             statusText = error.localizedDescription
         }
-        if resumeListeningAfterRecording {
-            resumeListeningAfterRecording = false
-            startListening()
-        }
+        resumeListeningIfNeeded()
     }
 
-    /// 为录像让出麦克风：停止听写但不改「用户意图上仍想听」的恢复标记。
-    private func pauseListeningForRecording() {
+    /// 为录像 / 倒计时让出麦克风：停止听写，结束后按标记恢复。
+    private func pauseListeningIfNeeded() {
+        guard isListening else { return }
+        resumeListeningAfterIdle = true
+        pauseListeningForCapture()
+    }
+
+    private func resumeListeningIfNeeded() {
+        guard resumeListeningAfterIdle else { return }
+        guard !camera.isRecording, !captureScheduler.isCountingDown else { return }
+        resumeListeningAfterIdle = false
+        startListening()
+    }
+
+    private func pauseListeningForCapture() {
         listeningTask?.cancel()
         listeningTask = nil
         volatileCommandTask?.cancel()
@@ -532,6 +551,8 @@ final class AskCameraViewModel: ObservableObject {
     // MARK: - 焦点跟随
 
     private func handleTrackingUpdate(_ update: FocusTracker.Update) {
+        // 倒计时闪灯期间不要重配对焦/曝光，避免把手电筒冲掉
+        if captureScheduler.isCountingDown { return }
         switch update {
         case .lost(let generation):
             guard generation == trackingGeneration else { return }
@@ -596,5 +617,50 @@ final class AskCameraViewModel: ObservableObject {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
         feedbackSynthesizer.speak(utterance)
+    }
+
+    /// 每秒按单反节奏滴一声或连滴；闪光灯开启时手电筒与屏幕同步闪。
+    private func playCountdownCue(remaining: Int) async {
+        countdownCueTask?.cancel()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runCountdownCue(remaining: remaining)
+        }
+        countdownCueTask = task
+        await task.value
+    }
+
+    private func runCountdownCue(remaining: Int) async {
+        let beeps = CountdownBeeper.beepCount(remaining: remaining)
+        let windowNs: UInt64 = 900_000_000
+        let onMs: UInt64 = remaining <= 2 ? 45 : 60
+        let intervalNs = windowNs / UInt64(max(beeps, 1))
+
+        for i in 0..<beeps {
+            guard !Task.isCancelled else { return }
+            countdownBeeper.play()
+            if countdownTorchEnabled {
+                countdownFlashOn = true
+                Task { await self.camera.setTorchEnabled(true) }
+            }
+            try? await Task.sleep(for: .milliseconds(onMs))
+            if countdownTorchEnabled {
+                countdownFlashOn = false
+                Task { await self.camera.setTorchEnabled(false) }
+            }
+            if i < beeps - 1 {
+                let elapsedOnNs = onMs * 1_000_000
+                let gapNs = intervalNs > elapsedOnNs ? intervalNs - elapsedOnNs : 20_000_000
+                try? await Task.sleep(nanoseconds: gapNs)
+            }
+        }
+    }
+
+    private func stopCountdownCues() async {
+        countdownCueTask?.cancel()
+        countdownCueTask = nil
+        countdownBeeper.stop()
+        countdownFlashOn = false
+        await camera.setTorchEnabled(false)
     }
 }

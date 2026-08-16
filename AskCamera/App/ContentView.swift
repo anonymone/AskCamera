@@ -64,14 +64,21 @@ struct ContentView: View {
 
     @ViewBuilder
     private var countdownOverlay: some View {
-        if let remaining = viewModel.captureScheduler.countdownRemaining {
-            Text("\(remaining)")
-                .font(.system(size: 96, weight: .thin, design: .rounded))
-                .foregroundStyle(.white)
-                .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
-                .transition(.scale.combined(with: .opacity))
-                .animation(.easeInOut(duration: 0.2), value: remaining)
-                .allowsHitTesting(false)
+        ZStack {
+            if viewModel.countdownFlashOn {
+                Color.white.opacity(0.72)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+            if let remaining = viewModel.captureScheduler.countdownRemaining {
+                Text("\(remaining)")
+                    .font(.system(size: 96, weight: .thin, design: .rounded))
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+                    .transition(.scale.combined(with: .opacity))
+                    .animation(.easeInOut(duration: 0.2), value: remaining)
+                    .allowsHitTesting(false)
+            }
         }
     }
 
@@ -153,13 +160,24 @@ struct ContentView: View {
                 .background(.black.opacity(0.55), in: Capsule())
             }
 
-            HStack(spacing: 22) {
+            HStack(spacing: 16) {
                 Toggle(isOn: $viewModel.voiceFeedbackEnabled) {
                     Image(systemName: "speaker.wave.2")
                 }
                 .toggleStyle(.button)
                 .tint(.yellow)
                 .foregroundStyle(.white)
+                .accessibilityLabel("语音反馈")
+
+                Toggle(isOn: $viewModel.countdownTorchEnabled) {
+                    Image(systemName: viewModel.countdownTorchEnabled
+                          ? "flashlight.on.fill"
+                          : "flashlight.off.fill")
+                }
+                .toggleStyle(.button)
+                .tint(.orange)
+                .foregroundStyle(.white)
+                .accessibilityLabel("倒计时闪光灯")
 
                 recordButton
                 shutterButton
