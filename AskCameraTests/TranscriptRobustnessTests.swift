@@ -186,4 +186,25 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertEqual(query?.displayName, "苹果")
         XCTAssertEqual(query?.useSaliency, false)
     }
+
+    func testLeftoverDropsConsumedPrefix() {
+        XCTAssertEqual(
+            TranscriptWindow.leftover(from: "对焦到苹果对焦到杯子", consumed: "对焦到苹果", lastCommand: "对焦到苹果"),
+            "对焦到杯子"
+        )
+    }
+
+    func testLeftoverAfterFailedUtteranceKeepsNextCommand() {
+        XCTAssertEqual(
+            TranscriptWindow.leftover(from: "嗯那个对焦到自行车", consumed: "嗯那个", lastCommand: ""),
+            "对焦到自行车"
+        )
+    }
+
+    func testLeftoverWithoutConsumedReturnsFullText() {
+        XCTAssertEqual(
+            TranscriptWindow.leftover(from: "对焦到自行车", consumed: "", lastCommand: ""),
+            "对焦到自行车"
+        )
+    }
 }

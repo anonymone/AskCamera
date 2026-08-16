@@ -1,12 +1,13 @@
 import AVFoundation
+import CoreMedia
 import Foundation
 import Speech
 
 /// 语音识别事件：volatile 为实时未定稿文本，final 为定稿文本。
-/// `alternatives` 为同段音频的次优转写，解析失败时按序再试。
+/// `generation` 在每次 `beginNewUtterance()` 后递增，用于丢掉上一句残留结果。
 enum TranscriptEvent {
-    case volatile(String, alternatives: [String])
-    case final(String, alternatives: [String])
+    case volatile(String, alternatives: [String], generation: UInt64)
+    case final(String, alternatives: [String], generation: UInt64)
 }
 
 enum SpeechListenerError: LocalizedError {
@@ -44,20 +45,31 @@ final class SpeechCommandListener {
     }
 
     private let audioEngine = AVAudioEngine()
+    private let stateLock = NSLock()
     private var analyzer: SpeechAnalyzer?
     private var module: Module?
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var resultsTask: Task<Void, Never>?
+    private var eventContinuation: AsyncStream<TranscriptEvent>.Continuation?
+    private var dropResults = false
+    private var sessionLocale = Locale(identifier: "zh-CN")
+    private var analyzerFormat: AVAudioFormat?
 
     private(set) var isListening = false
     /// 当前模块名（供日志/调试）。
     private(set) var activeModuleName = ""
+    /// 每次新开识别输入后递增；ViewModel 用它忽略上一句的残留事件。
+    private(set) var inputGeneration: UInt64 = 0
 
     /// 启动监听，返回识别事件流。
     func start(locale: Locale = Locale(identifier: "zh-CN")) async throws -> AsyncStream<TranscriptEvent> {
         guard await AVAudioApplication.requestRecordPermission() else {
             throw SpeechListenerError.microphoneDenied
         }
+
+        sessionLocale = locale
+        inputGeneration = 0
+        dropResults = false
 
         let module = try await makeModule(locale: locale)
         self.module = module
@@ -69,36 +81,55 @@ final class SpeechCommandListener {
         guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module.speechModule]) else {
             throw SpeechListenerError.localeNotSupported(locale)
         }
+        self.analyzerFormat = analyzerFormat
 
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-        self.inputBuilder = inputBuilder
+        setInputBuilder(inputBuilder)
 
         try configureAudioSession()
-        try startAudioEngine(convertingTo: analyzerFormat, into: inputBuilder)
+        try startAudioEngine(convertingTo: analyzerFormat)
         try await analyzer.start(inputSequence: inputSequence)
         isListening = true
 
         let (eventStream, eventContinuation) = AsyncStream<TranscriptEvent>.makeStream()
-        resultsTask = Task {
-            do {
-                switch module {
-                case .dictation(let transcriber):
-                    for try await result in transcriber.results {
-                        yieldTranscript(result.text, alternatives: result.alternatives,
-                                        isFinal: result.isFinal, to: eventContinuation)
-                    }
-                case .transcription(let transcriber):
-                    for try await result in transcriber.results {
-                        yieldTranscript(result.text, alternatives: result.alternatives,
-                                        isFinal: result.isFinal, to: eventContinuation)
-                    }
-                }
-            } catch {
-                print("[SpeechCommandListener] 识别流中断: \(error)")
-            }
-            eventContinuation.finish()
-        }
+        self.eventContinuation = eventContinuation
+        startResultsTask(module: module, continuation: eventContinuation)
         return eventStream
+    }
+
+    /// 一条指令（或一句失败定稿）结束后：finalize 当前输入，再 `start` 新序列。
+    /// 麦克风 tap 不停；不调用 finish 系 API，以免关掉整个 analyzer。
+    func beginNewUtterance() async {
+        guard isListening, analyzer != nil else { return }
+
+        stateLock.lock()
+        inputGeneration += 1
+        dropResults = true
+        let oldBuilder = inputBuilder
+        inputBuilder = nil
+        stateLock.unlock()
+
+        oldBuilder?.finish()
+
+        do {
+            try await analyzer?.finalize(through: nil)
+        } catch {
+            print("[SpeechCommandListener] finalize 当前输入失败: \(error)")
+        }
+
+        let (inputSequence, newBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+        setInputBuilder(newBuilder)
+
+        do {
+            try await analyzer?.start(inputSequence: inputSequence)
+            stateLock.lock()
+            dropResults = false
+            stateLock.unlock()
+            print("[SpeechCommandListener] 已开始新的识别输入 generation=\(inputGeneration)")
+        } catch {
+            print("[SpeechCommandListener] 复用 analyzer 失败，重建会话: \(error)")
+            await rebuildSession()
+        }
     }
 
     func stop() async {
@@ -107,13 +138,16 @@ final class SpeechCommandListener {
 
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
-        inputBuilder?.finish()
+        setInputBuilder(nil)
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
         resultsTask?.cancel()
         resultsTask = nil
+        eventContinuation?.finish()
+        eventContinuation = nil
         analyzer = nil
         module = nil
-        inputBuilder = nil
+        analyzerFormat = nil
+        dropResults = false
     }
 
     // MARK: - 模块创建与资产
@@ -162,14 +196,75 @@ final class SpeechCommandListener {
         return .transcription(transcriber)
     }
 
+    private func rebuildSession() async {
+        resultsTask?.cancel()
+        resultsTask = nil
+        analyzer = nil
+        module = nil
+
+        do {
+            let module = try await makeModule(locale: sessionLocale)
+            self.module = module
+            let analyzer = SpeechAnalyzer(modules: [module.speechModule])
+            self.analyzer = analyzer
+            try? await analyzer.setContext(SpeechVocabulary.analysisContext())
+
+            let (inputSequence, builder) = AsyncStream<AnalyzerInput>.makeStream()
+            setInputBuilder(builder)
+            try await analyzer.start(inputSequence: inputSequence)
+
+            if let continuation = eventContinuation {
+                startResultsTask(module: module, continuation: continuation)
+            }
+            stateLock.lock()
+            dropResults = false
+            stateLock.unlock()
+            print("[SpeechCommandListener] 已重建识别会话 generation=\(inputGeneration)")
+        } catch {
+            print("[SpeechCommandListener] 重建识别会话失败: \(error)")
+            stateLock.lock()
+            dropResults = false
+            stateLock.unlock()
+        }
+    }
+
+    private func startResultsTask(module: Module, continuation: AsyncStream<TranscriptEvent>.Continuation) {
+        resultsTask = Task { [weak self] in
+            do {
+                switch module {
+                case .dictation(let transcriber):
+                    for try await result in transcriber.results {
+                        self?.yieldTranscript(result.text, alternatives: result.alternatives,
+                                              isFinal: result.isFinal, to: continuation)
+                    }
+                case .transcription(let transcriber):
+                    for try await result in transcriber.results {
+                        self?.yieldTranscript(result.text, alternatives: result.alternatives,
+                                              isFinal: result.isFinal, to: continuation)
+                    }
+                }
+            } catch {
+                print("[SpeechCommandListener] 识别流中断: \(error)")
+            }
+        }
+    }
+
     private func yieldTranscript(_ best: AttributedString,
                                  alternatives: [AttributedString],
                                  isFinal: Bool,
                                  to continuation: AsyncStream<TranscriptEvent>.Continuation) {
+        stateLock.lock()
+        let drop = dropResults
+        let generation = inputGeneration
+        stateLock.unlock()
+        guard !drop else { return }
+
         let text = String(best.characters)
         guard !text.isEmpty else { return }
         let alts = alternatives.map { String($0.characters) }.filter { !$0.isEmpty && $0 != text }
-        continuation.yield(isFinal ? .final(text, alternatives: alts) : .volatile(text, alternatives: alts))
+        continuation.yield(isFinal
+            ? .final(text, alternatives: alts, generation: generation)
+            : .volatile(text, alternatives: alts, generation: generation))
     }
 
     /// 确认端侧模型已安装，必要时触发系统下载。
@@ -184,6 +279,18 @@ final class SpeechCommandListener {
 
     // MARK: - 音频采集
 
+    private func setInputBuilder(_ builder: AsyncStream<AnalyzerInput>.Continuation?) {
+        stateLock.lock()
+        inputBuilder = builder
+        stateLock.unlock()
+    }
+
+    private func currentInputBuilder() -> AsyncStream<AnalyzerInput>.Continuation? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return inputBuilder
+    }
+
     private func configureAudioSession() throws {
         let audioSession = AVAudioSession.sharedInstance()
         // .default 模式保留系统 AGC/降噪处理链（.measurement 会关闭，嘈杂环境准确率下降）
@@ -191,15 +298,16 @@ final class SpeechCommandListener {
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
     }
 
-    private func startAudioEngine(convertingTo analyzerFormat: AVAudioFormat,
-                                  into inputBuilder: AsyncStream<AnalyzerInput>.Continuation) throws {
+    private func startAudioEngine(convertingTo analyzerFormat: AVAudioFormat) throws {
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
         let converter = AVAudioConverter(from: inputFormat, to: analyzerFormat)
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { buffer, _ in
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+            guard let self else { return }
+            guard let builder = self.currentInputBuilder() else { return }
             guard let converter else {
-                inputBuilder.yield(AnalyzerInput(buffer: buffer))
+                builder.yield(AnalyzerInput(buffer: buffer))
                 return
             }
             let ratio = analyzerFormat.sampleRate / inputFormat.sampleRate
@@ -218,7 +326,7 @@ final class SpeechCommandListener {
                 return buffer
             }
             if error == nil, converted.frameLength > 0 {
-                inputBuilder.yield(AnalyzerInput(buffer: converted))
+                builder.yield(AnalyzerInput(buffer: converted))
             }
         }
 

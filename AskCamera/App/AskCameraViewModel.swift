@@ -59,9 +59,12 @@ final class AskCameraViewModel: ObservableObject {
         let text: String
     }
 
-    /// 已执行指令对应的转写原文。后续字幕只显示这段之后的新内容，
-    /// 避免 SpeechAnalyzer 连续会话把上一句拼进下一句。
+    /// 已执行指令对应的转写原文。后续字幕只显示这段之后的新内容；
+    /// 定稿后会重置识别输入，此字段主要作重置失败时的字符串回退。
     private var consumedTranscript = ""
+
+    /// 与 SpeechCommandListener.inputGeneration 对齐，丢掉上一句残留事件。
+    private var speechGeneration: UInt64 = 0
 
     private var listeningTask: Task<Void, Never>?
     private var highlightDismissTask: Task<Void, Never>?
@@ -160,6 +163,7 @@ final class AskCameraViewModel: ObservableObject {
                 statusText = "正在准备语音模型……"
                 let events = try await speech.start()
                 isListening = true
+                speechGeneration = speech.inputGeneration
                 consumedTranscript = ""
                 lastConsumedTarget = ""
                 captionHistory = []
@@ -167,11 +171,13 @@ final class AskCameraViewModel: ObservableObject {
                 statusText = "正在聆听：对焦 / 拍照 / 录像"
                 for await event in events {
                     switch event {
-                    case .volatile(let text, let alternatives):
+                    case .volatile(let text, let alternatives, let generation):
+                        guard generation == speechGeneration else { continue }
                         let leftover = leftoverTranscript(from: text)
                         volatileTranscript = leftover
                         scheduleVolatileCommand(sourceText: text, alternatives: alternatives)
-                    case .final(let text, let alternatives):
+                    case .final(let text, let alternatives, let generation):
+                        guard generation == speechGeneration else { continue }
                         volatileTranscript = ""
                         volatileCommandTask?.cancel()
                         let leftover = leftoverTranscript(from: text)
@@ -179,6 +185,7 @@ final class AskCameraViewModel: ObservableObject {
                             appendCaption(leftover)
                         }
                         await handleTranscriptCandidates(best: text, alternatives: alternatives, isFinal: true)
+                        await resetRecognizerAfterUtterance()
                     }
                 }
             } catch {
@@ -202,9 +209,7 @@ final class AskCameraViewModel: ObservableObject {
 
     // MARK: - 指令处理
 
-    private static let captionTrimCharacters = CharacterSet.whitespacesAndNewlines
-        .union(.punctuationCharacters)
-        .union(CharacterSet(charactersIn: "。！？、，,.!?"))
+    private static let captionTrimCharacters = TranscriptWindow.trimCharacters
 
     /// 定稿字幕，保留最近 3 行；指令执行后会整表清空。
     private func appendCaption(_ text: String) {
@@ -218,45 +223,23 @@ final class AskCameraViewModel: ObservableObject {
 
     /// 去掉已执行指令对应的前缀，只留下尚未消费的新句子。
     private func leftoverTranscript(from full: String) -> String {
-        let fullText = full.trimmingCharacters(in: .whitespacesAndNewlines)
-        let consumed = consumedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !consumed.isEmpty else { return fullText }
-
-        if fullText.hasPrefix(consumed) {
-            return String(fullText.dropFirst(consumed.count))
-                .trimmingCharacters(in: Self.captionTrimCharacters)
-        }
-        if let range = fullText.range(of: consumed, options: .backwards) {
-            let tail = String(fullText[range.upperBound...])
-                .trimmingCharacters(in: Self.captionTrimCharacters)
-            if !tail.isEmpty { return tail }
-        }
-
-        // ASR 改写前文时，只能按「上次整句指令」切开，不能按 displayName（「鼠标」）。
-        // 否则「对焦到鼠标」之后再说「对焦到左边的鼠标」，会从句尾的「鼠标」切开变成空串。
-        let command = lastConsumedTarget.trimmingCharacters(in: .whitespacesAndNewlines)
-        if command.count >= 4, let range = fullText.range(of: command, options: .backwards) {
-            let tail = String(fullText[range.upperBound...])
-                .trimmingCharacters(in: Self.captionTrimCharacters)
-            if Self.containsCommandTrigger(tail) || CommandCandidateRanker.looksLikeOpenCommand(tail) {
-                return tail
-            }
-        }
-        return fullText
-    }
-
-    private static func containsCommandTrigger(_ text: String) -> Bool {
-        let lowered = TranscriptNormalizer.normalize(text).lowercased()
-        let triggers = [
-            "对焦", "对准", "聚焦", "焦点", "focus",
-            "拍照", "照相", "拍摄", "录像", "录制", "record",
-        ]
-        return triggers.contains { lowered.contains($0) }
+        TranscriptWindow.leftover(from: full, consumed: consumedTranscript, lastCommand: lastConsumedTarget)
     }
 
     /// 指令已执行：记下已消费原文并清空字幕，下一句从空白开始。
     private func consumeTranscript(_ text: String) {
         consumedTranscript = text
+        captionHistory = []
+        volatileTranscript = ""
+    }
+
+    /// 定稿处理完后重置识别输入，避免下一句粘在旧转写上。
+    private func resetRecognizerAfterUtterance() async {
+        guard isListening else { return }
+        await speech.beginNewUtterance()
+        speechGeneration = speech.inputGeneration
+        consumedTranscript = ""
+        lastConsumedTarget = ""
         captionHistory = []
         volatileTranscript = ""
     }
@@ -323,6 +306,8 @@ final class AskCameraViewModel: ObservableObject {
             if !leftover.isEmpty {
                 statusText = "\u{201C}\(leftover)\u{201D}（未识别为指令）"
             }
+            // 解析失败也消费：若识别输入还没重置成功，下一句 leftover 只剩后缀
+            consumeTranscript(best)
         }
     }
 
@@ -354,6 +339,7 @@ final class AskCameraViewModel: ObservableObject {
             if query.objectUnresolved {
                 if isFinal {
                     statusText = "还不能把\u{201C}\(query.displayName)\u{201D}当成检测目标"
+                    consumeTranscript(sourceText)
                 }
                 return isFinal
             }
