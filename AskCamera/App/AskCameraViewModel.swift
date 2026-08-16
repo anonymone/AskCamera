@@ -238,7 +238,7 @@ final class AskCameraViewModel: ObservableObject {
         if command.count >= 4, let range = fullText.range(of: command, options: .backwards) {
             let tail = String(fullText[range.upperBound...])
                 .trimmingCharacters(in: Self.captionTrimCharacters)
-            if Self.containsCommandTrigger(tail) {
+            if Self.containsCommandTrigger(tail) || CommandCandidateRanker.looksLikeOpenCommand(tail) {
                 return tail
             }
         }
@@ -310,7 +310,8 @@ final class AskCameraViewModel: ObservableObject {
         if let chosen = CommandCandidateRanker.pick(
             best: candidates.first ?? best,
             alternatives: Array(candidates.dropFirst()),
-            leftover: leftoverTranscript
+            leftover: leftoverTranscript,
+            allowOpenPrimary: isFinal
         ) {
             let leftover = leftoverTranscript(from: chosen)
             if await handleTranscript(leftover, sourceText: chosen, isFinal: isFinal) {
@@ -330,8 +331,13 @@ final class AskCameraViewModel: ObservableObject {
         guard !leftover.isEmpty else { return false }
         let now = CACurrentMediaTime()
 
-        // 采集指令优先于对焦；只解析尚未消费的新句子，避免累积转写里的旧「拍照」反复命中
-        if let capture = CaptureCommandParser.parse(leftover) {
+        // volatile：只用规则；final：规则未命中时由端模型理解非正式动作/主体
+        guard let intent = await QueryUnderstanding.understand(leftover, allowLanguageModel: isFinal) else {
+            return false
+        }
+
+        switch intent {
+        case .capture(let capture):
             if capture == lastExecutedCaptureCommand, now - lastExecutedAt < 3 {
                 return true
             }
@@ -342,35 +348,31 @@ final class AskCameraViewModel: ObservableObject {
             lastConsumedTarget = leftover
             consumeTranscript(sourceText)
             return true
-        }
 
-        // volatile：禁用端模型（半句）；final：端模型从整句提取主体英文
-        guard let query = await QueryUnderstanding.resolve(leftover, allowLanguageModel: isFinal) else {
-            return false
-        }
-        if query.action == .none { return false }
-        if query.objectUnresolved {
-            if isFinal {
-                statusText = "还不能把\u{201C}\(query.displayName)\u{201D}当成检测目标"
+        case .query(let query):
+            if query.action == .none { return false }
+            if query.objectUnresolved {
+                if isFinal {
+                    statusText = "还不能把\u{201C}\(query.displayName)\u{201D}当成检测目标"
+                }
+                return isFinal
             }
-            return isFinal
-        }
 
-        // 去重看检测意图，不看 displayName（连读改写会让文案变长但 prompts 相同）
-        if query.action == lastExecutedQuery?.action,
-           query.yoloPrompts == lastExecutedQuery?.yoloPrompts,
-           query.spatialHint == lastExecutedQuery?.spatialHint,
-           now - lastExecutedAt < 3 {
+            if query.action == lastExecutedQuery?.action,
+               query.yoloPrompts == lastExecutedQuery?.yoloPrompts,
+               query.spatialHint == lastExecutedQuery?.spatialHint,
+               now - lastExecutedAt < 3 {
+                return true
+            }
+            lastExecutedQuery = query
+            lastExecutedAt = now
+
+            print("[ViewModel] route=focus isFinal=\(isFinal) leftover=\(leftover) action=\(query.action) prompts=\(query.yoloPrompts) saliency=\(query.useSaliency)")
+            await execute(query)
+            lastConsumedTarget = leftover
+            consumeTranscript(sourceText)
             return true
         }
-        lastExecutedQuery = query
-        lastExecutedAt = now
-
-        print("[ViewModel] route=focus isFinal=\(isFinal) leftover=\(leftover) action=\(query.action) prompts=\(query.yoloPrompts) saliency=\(query.useSaliency)")
-        await execute(query)
-        lastConsumedTarget = leftover
-        consumeTranscript(sourceText)
-        return true
     }
 
     // MARK: - 采集执行

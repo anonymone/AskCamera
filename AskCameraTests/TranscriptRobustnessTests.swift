@@ -65,6 +65,26 @@ final class TranscriptRobustnessTests: XCTestCase {
         XCTAssertNil(FocusIntentParser.parseCommand("鼠标"))
         XCTAssertNil(CaptureCommandParser.parse("鼠标"))
         XCTAssertEqual(CommandCandidateRanker.score("鼠标"), 0)
+        XCTAssertFalse(CommandCandidateRanker.looksLikeOpenCommand("鼠标"))
+    }
+
+    func testInformalPhrasingIsNotARuleCommand() {
+        XCTAssertNil(FocusIntentParser.parseCommand("镜头对着自行车"))
+        XCTAssertNil(CaptureCommandParser.parse("镜头对着自行车"))
+        XCTAssertNil(CaptureCommandParser.parse("给它来一张"))
+        XCTAssertNil(CaptureCommandParser.parse("录一下"))
+        XCTAssertEqual(CommandCandidateRanker.score("镜头对着自行车"), 0)
+        XCTAssertTrue(CommandCandidateRanker.looksLikeOpenCommand("镜头对着自行车"))
+        XCTAssertTrue(CommandCandidateRanker.looksLikeOpenCommand("给它来一张"))
+        XCTAssertFalse(CommandCandidateRanker.looksLikeOpenCommand("嗯"))
+    }
+
+    func testUnderstandUsesCaptureRulesWithoutLanguageModel() async {
+        let photo = await QueryUnderstanding.understand("拍照", allowLanguageModel: false)
+        XCTAssertEqual(photo, .capture(.photo(delaySeconds: 0)))
+
+        let informal = await QueryUnderstanding.understand("镜头对着自行车", allowLanguageModel: false)
+        XCTAssertNil(informal)
     }
 
     func testOpenVocabularyNounsFromLexicon() async {
@@ -112,6 +132,25 @@ final class TranscriptRobustnessTests: XCTestCase {
             leftover: { $0 }
         )
         XCTAssertEqual(picked, "对角到平果")
+    }
+
+    func testNBestKeepsInformalPrimaryForLanguageModel() {
+        let picked = CommandCandidateRanker.pick(
+            best: "镜头对着自行车",
+            alternatives: ["拍照", "开始录像"],
+            leftover: { $0 },
+            allowOpenPrimary: true
+        )
+        XCTAssertEqual(picked, "镜头对着自行车")
+        XCTAssertEqual(
+            CommandCandidateRanker.pick(
+                best: "镜头对着自行车",
+                alternatives: ["拍照"],
+                leftover: { $0 },
+                allowOpenPrimary: false
+            ),
+            "拍照"
+        )
     }
 
     func testFocusParserKeepsCompoundObjectSpan() {

@@ -26,7 +26,7 @@ enum FocusCommand: Equatable {
 }
 
 /// 规则式意图解析（快路径）。
-/// 覆盖常见句式；复杂指代表达式后续接入 Foundation Models 慢路径。
+/// 覆盖常见句式；非正式说法（「镜头对着杯子」）留给定稿端模型。
 enum FocusIntentParser {
 
     /// 取消指令关键词。
